@@ -1239,7 +1239,49 @@ def strip_publish_subject(subject: str) -> str:
     return subject
 
 
-def derive_factcheck_title(meta: dict, result: str) -> str:
+def is_image_ocr_job(meta: dict) -> bool:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+    return any(str(item.get("extension") or Path(str(item.get("saved_name") or "")).suffix).lower() in image_suffixes for item in meta.get("attachments", []))
+
+
+def first_ocr_sentence_title(job_dir: Path, meta: dict) -> str:
+    if not is_image_ocr_job(meta):
+        return ""
+    combined_path = job_dir / "extracted" / "combined.txt"
+    if not combined_path.exists():
+        return ""
+    lines: list[str] = []
+    for raw in combined_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = re.sub(r"\s+", " ", raw).strip(" #\t")
+        if not line or line.lower().startswith("anhang "):
+            continue
+        if line.startswith("## Anhang"):
+            continue
+        # Social-media screenshots often start with account names/handles before
+        # the actual claim. Those are not good public titles; use the first real
+        # sentence from the OCR text instead.
+        if "@" in line and not re.search(r"[.!?]", line):
+            continue
+        line = line.strip("& •·|–—- ")
+        if line:
+            lines.append(line)
+    text = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if not text:
+        return ""
+    match = re.search(r"([A-ZÄÖÜ0-9][^.!?]{18,180}[.!?])(?:\s|$)", text)
+    if match:
+        return match.group(1).strip(" .,:;–—-„“\"'")[:120]
+    for line in lines:
+        if 20 <= len(line) <= 140:
+            return line.strip(" .,:;–—-„“\"'")[:120]
+    return ""
+
+
+def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None) -> str:
+    if job_dir is not None:
+        ocr_title = first_ocr_sentence_title(job_dir, meta)
+        if ocr_title:
+            return ocr_title
     subject = strip_publish_subject(meta.get("subject") or "")
     if subject and not re.match(r"^[A-Za-z]{1,4}$", subject):
         return subject[:120]
@@ -1299,6 +1341,33 @@ def inline_public_html(value: str) -> str:
     return escaped
 
 
+PUBLIC_LABELS = (
+    "Kurzfazit",
+    "Gesamtbewertung",
+    "Tatsachenkern",
+    "Framing/Wirkung",
+    "Absicht",
+    "Kritischer Befund",
+    "Aussage",
+    "Bewertung",
+    "Warum",
+    "Quellenbezug",
+    "Einordnung",
+    "Unsicherheiten",
+    "Unsicherheit",
+    "OCR-/Übertragungsunsicherheit",
+    "Offen",
+    "Wahrscheinlich gemeinter Wortlaut",
+    "Der wahrscheinlich gemeinte Wortlaut",
+    "Der wahrscheinlich gemeinte Wortlaut lautet",
+    "Rekonstruierter wahrscheinlicher Wortlaut",
+)
+
+
+def public_label_regex(labels: tuple[str, ...] = PUBLIC_LABELS) -> str:
+    return "(?:" + "|".join(re.escape(label) for label in labels) + ")"
+
+
 def sanitize_public_text(value: str) -> str:
     value = html.unescape(value or "")
     value = value.replace("\r\n", "\n").replace("\r", "\n")
@@ -1316,7 +1385,7 @@ def public_text_blocks(value: str, strong: bool = False) -> str:
     blocks: list[str] = []
     for paragraph in re.split(r"\n\s*\n", value):
         lines = [line.rstrip() for line in paragraph.splitlines()]
-        text = "<br />\n".join(inline_public_html(line) for line in lines if line.strip())
+        text = "<br />\n".join(format_factcheck_detail_html(line) for line in lines if line.strip())
         if not text:
             continue
         if strong:
@@ -1326,17 +1395,27 @@ def public_text_blocks(value: str, strong: bool = False) -> str:
 
 
 def format_factcheck_detail_text(value: str) -> str:
-    value = re.sub(r"\s+(Warum\s*:)", "\n" + r"\1", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+(Quellenbezug\s*:)", "\n" + r"\1", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+(Einordnung\s*:)", "\n" + r"\1", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+(Offen\s*:)", "\n" + r"\1", value, flags=re.IGNORECASE)
+    label_re = public_label_regex(tuple(label for label in PUBLIC_LABELS if label not in {"Kurzfazit", "Gesamtbewertung"}))
+    value = re.sub(r"\s+(%s\s*:)" % label_re, "\n" + r"\1", value, flags=re.IGNORECASE)
     return value.strip()
 
 
 def format_factcheck_detail_html(value: str) -> str:
     rendered = inline_public_html(format_factcheck_detail_text(value)).replace("\n", "<br />\n")
-    for label in ("Kurzfazit", "Gesamtbewertung", "Tatsachenkern", "Framing/Wirkung", "Absicht", "Kritischer Befund", "Bewertung", "Quellenbezug", "Einordnung"):
+    for label in PUBLIC_LABELS:
         rendered = re.sub(r"(?<!<strong>)(%s\s*:)(?!</strong>)" % label, r"<strong>\1</strong>", rendered)
+    rendered = re.sub(
+        r"(?<!<strong>)((?:Der\s+)?wahrscheinlich(?:e|er)?\s+gemeinte(?:r)?\s+Wortlaut(?:\s+[^:<]{0,80})?\s*:)(?!</strong>)",
+        r"<strong>\1</strong>",
+        rendered,
+        flags=re.IGNORECASE,
+    )
+    rendered = re.sub(
+        r"(?<!<strong>)((?:Rekonstruierter\s+)?wahrscheinlicher\s+Wortlaut\s*:)(?!</strong>)",
+        r"<strong>\1</strong>",
+        rendered,
+        flags=re.IGNORECASE,
+    )
     return rendered
 
 
@@ -1392,13 +1471,13 @@ def markdownish_to_html(text: str) -> str:
     def flush_paragraph() -> None:
         nonlocal paragraph
         if paragraph:
-            structured_labels = r"^\s*(Gesamtbewertung|Tatsachenkern|Framing/Wirkung|Absicht|Kritischer Befund)\s*:"
+            structured_labels = r"^\s*%s\s*:" % public_label_regex()
             if paragraph and (re.match(structured_labels, paragraph[0], flags=re.IGNORECASE) or any(re.match(structured_labels, item, flags=re.IGNORECASE) for item in paragraph)):
                 text = "\n".join(paragraph).strip()
             else:
                 text = " ".join(paragraph).strip()
             if re.match(r"(?iu)^Aussage\s*:", text):
-                split = re.search(r"\s+(Bewertung|Warum|Quellenbezug|Einordnung|Offen)\s*:", text, flags=re.IGNORECASE)
+                split = re.search(r"\s+(%s)\s*:" % public_label_regex(tuple(label for label in PUBLIC_LABELS if label != "Aussage")), text, flags=re.IGNORECASE)
                 if split:
                     claim_text = text[:split.start()].strip()
                     rest_text = text[split.start():].strip()
@@ -1408,10 +1487,10 @@ def markdownish_to_html(text: str) -> str:
                 else:
                     html_lines.append('<p class="afd-faktencheck-claim"><strong>%s</strong></p>' % inline_public_html(text))
             else:
-                if re.match(r"^\s*(Kurzfazit|Gesamtbewertung|Tatsachenkern|Framing/Wirkung|Absicht|Kritischer Befund)\s*:", text, flags=re.IGNORECASE):
+                if re.match(r"^\s*%s\s*:" % public_label_regex(), text, flags=re.IGNORECASE):
                     html_lines.append("<p>%s</p>" % format_factcheck_detail_html(text))
                 else:
-                    html_lines.append("<p>%s</p>" % inline_public_html(text))
+                    html_lines.append("<p>%s</p>" % format_factcheck_detail_html(text))
             paragraph = []
 
     def close_list() -> None:
@@ -1449,7 +1528,7 @@ def markdownish_to_html(text: str) -> str:
             if not in_list:
                 html_lines.append("<ul>")
                 in_list = True
-            html_lines.append("<li>%s</li>" % inline_public_html(line.lstrip('-*• ').strip()))
+            html_lines.append("<li>%s</li>" % format_factcheck_detail_html(line.lstrip('-*• ').strip()))
             continue
         paragraph.append(line)
     flush_paragraph(); close_list()
@@ -1703,7 +1782,7 @@ def create_or_update_factcheck_page(job_dir: Path, settings: dict, meta: dict) -
     publish_cfg = settings.get("publish", {})
     parent_id = ensure_faktencheck_parent(settings)
     result = (job_dir / "result" / "factcheck.md").read_text(encoding="utf-8", errors="replace")
-    title = derive_factcheck_title(meta, result)
+    title = derive_factcheck_title(meta, result, job_dir)
     slug_base = slugify(title, "faktencheck-" + meta["job_id"][:8])
     slug = slug_base
     html_content = build_page_html(job_dir, meta, title)
