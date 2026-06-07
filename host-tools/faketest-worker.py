@@ -923,6 +923,138 @@ def find_video_timestamp_for_claim(claim: str, segments: list[dict]) -> dict | N
     }
 
 
+OPEN_SOURCE_NEED_RE = re.compile(
+    r"\b(Offen\s*:|N[oö]tig(?:\s+w[aä]re|\s+wären)?|Ben[oö]tigt(?:\s+werden|\s+w[üu]rden)?|Originalquelle|Prim[aä]rquelle|Original[- ]?INSA|Originalzitat|Transkript|Erhebungszeitraum|Rohwerte|Ministeriumsquelle)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def evaluation_needs_followup(evaluation: str) -> bool:
+    if not evaluation:
+        return False
+    if re.search(r"(?im)^\s*Nachsuche\s*:", evaluation) and not re.search(r"(?im)^\s*Offen\s*:", evaluation):
+        if re.search(r"(?i)Gezielt\s+gesucht\s+(?:nach|mit)", evaluation):
+            return False
+        severe_open = re.compile(
+            r"\b(N[oö]tig\s+w[aä]re(?:n)?|Ben[oö]tigt\s+(?:werden|w[üu]rden)|F[üu]r\s+harte\s+Pr[üu]fung\s+fehl(?:t|en))\b",
+            flags=re.IGNORECASE,
+        )
+        if severe_open.search(evaluation):
+            return True
+        return bool(re.search(r"\b(Originalquelle|Prim[aä]rquelle|Original[- ]?INSA|Originalzitat|Transkript|Erhebungszeitraum|Rohwerte|Ministeriumsquelle)\b", evaluation, flags=re.IGNORECASE))
+    return bool(OPEN_SOURCE_NEED_RE.search(evaluation))
+
+
+def build_followup_queries(claim_text: str, evaluation: str) -> list[str]:
+    base = re.sub(r"\s+", " ", claim_text or "").strip()
+    context = (base + " " + re.sub(r"\s+", " ", evaluation or "")).strip()
+    queries: list[str] = []
+
+    def add(query: str) -> None:
+        query = re.sub(r"\s+", " ", query).strip(" -;:,.")[:500]
+        if query and query not in queries:
+            queries.append(query)
+
+    if re.search(r"\b(INSA|Umfrage|Sonntagsfrage|Prozent|AfD|Union|CDU|CSU)\b", context, flags=re.IGNORECASE):
+        add(base + " INSA Sonntagsfrage Erhebungszeitraum Auftraggeber")
+        add(base + " wahlrecht.de INSA DAWUM PolitPro")
+        add(base + " Original INSA Wahlumfrage")
+    if re.search(r"\b(Putin|Kreml|Russland|Nord\s*Stream|Gazprom|Gas|AfD)\b", context, flags=re.IGNORECASE):
+        add(base + " Putin Kreml Originalzitat Transkript")
+        add(base + " Nord Stream Gazprom Reuters AfD")
+        add(base + " Putin AfD Nord Stream Gas Originalquelle")
+    if re.search(r"\b(Warken|Pflege|100\.000|100000|Elternunterhalt|Gesundheitsminister)\b", context, flags=re.IGNORECASE):
+        add(base + " Nina Warken Pflege 100000 Euro Original Interview")
+        add(base + " Nina Warken Rheinische Post Pflege 100000 Euro")
+        add(base + " Bundesgesundheitsministerium Warken Pflege 100000")
+    if re.search(r"\b(B[üu]rgergeld|Ausl[aä]nder|Bundesagentur|BA|SGB\s*II|Leistungsberechtigte)\b", context, flags=re.IGNORECASE):
+        add(base + " Bundesagentur für Arbeit Statistik Bürgergeld Ausländer")
+        add(base + " BA Statistik SGB II Staatsangehörigkeit Bürgergeld")
+        add(base + " Bürgergeld Ausländer 2,4 Millionen Bundesagentur")
+    if re.search(r"\b(Merz|Ukraine|Balkan|Westbalkan|EU|Beistandsklausel|assoziiert|Light)\b", context, flags=re.IGNORECASE):
+        add(base + " Merz Ukraine EU Sonderstatus Beistandsklausel Original")
+        add(base + " Bundesregierung Merz Westbalkan EU Erweiterung Statement")
+        add(base + " Merz assoziierte Mitgliedschaft Ukraine EU Brief")
+    add(base + " Originalquelle Primärquelle Kontext")
+    return queries[:4]
+
+
+def merge_sources_unique(groups: list[list[dict]], limit: int = 10) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for source in group or []:
+            url = str(source.get("url") or "").strip()
+            key = url or (str(source.get("title") or "") + str(source.get("content") or "")[:80])
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(source)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def followup_research_for_evaluation(job_dir: Path, settings: dict, group_index: int, claim_text: str, evaluation: str) -> tuple[str, list[dict], list[dict]]:
+    queries = build_followup_queries(claim_text, evaluation)
+    searches: list[dict] = []
+    source_groups: list[list[dict]] = []
+    for query in queries:
+        sources = search_web(settings, query) if query else []
+        searches.append({"query": query, "sources": sources})
+        source_groups.append(sources)
+    merged = merge_sources_unique(source_groups, limit=10)
+    followup_dir = job_dir / "research" / "claim-followup"
+    followup_dir.mkdir(parents=True, exist_ok=True)
+    (followup_dir / ("group-%02d-followup.json" % group_index)).write_text(json.dumps({"claim": claim_text, "queries": searches}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if not merged:
+        searched = "; ".join(queries[:3]) or claim_text
+        revised = re.sub(r"(?ims)^Offen\s*:.*$", "", evaluation or "").strip()
+        revised = re.sub(r"\n{3,}", "\n\n", revised).strip()
+        if not re.search(r"(?im)^Bewertung\s*:", revised):
+            revised = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\n" + revised
+        revised += "\nNachsuche: Gezielt gesucht nach: %s. Es wurden keine ausreichend passenden Quellen gefunden. Deshalb wird aus dem Quellenmangel keine Negativbewertung abgeleitet." % searched
+        return revised.strip(), searches, merged
+    source_lines = []
+    for i, s in enumerate(merged[:8], 1):
+        source_lines.append("[%d] %s | %s | %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:320]))
+    prompt = """Die folgende automatische Einzelbewertung enthält offene Quellenbedarfe. Überarbeite sie anhand der gezielten Nachsuche.
+
+Regeln:
+- Ein Faktencheck darf nicht nur schreiben, was man suchen müsste. Nutze die Nachsuche sichtbar.
+- Wenn die Nachsuche die Aussage stützt oder widerlegt, nenne die Quelle und den Stand/Kontext.
+- Wenn die Nachsuche nicht reicht, schreibe transparent: "Gezielt gesucht nach ...; nicht ausreichend gefunden".
+- Verwechsle fehlende Treffer nicht mit "falsch".
+- Entferne pauschale Sätze wie "Nötig wäre ..." oder "Benötigt werden ...", außer sie stehen nachweislich nach erfolgter Nachsuche und erklären den Restmangel.
+
+Aussage:
+%s
+
+Bisherige Bewertung:
+%s
+
+Gezielte Nachsuche:
+%s
+
+Antworte in diesen Zeilen:
+Bewertung: <Ampel + Status>
+Warum: <2-4 Sätze mit Nachsuche-Ergebnis>
+Quellen: <konkrete Treffer oder "keine ausreichenden Treffer", mit [Nr.]>
+Einordnung: <Kontext/Framing>
+Nachsuche: <welche gezielten Suchziele abgearbeitet wurden und was noch nicht belastbar ist>
+""" % (claim_text, evaluation, "\n".join(source_lines))
+    try:
+        revised = call_bifrost(settings, prompt, max_tokens=520)
+    except Exception as exc:
+        searched = "; ".join(queries[:3])
+        revised = (evaluation or "").strip() + "\nNachsuche: Gezielt gesucht nach: %s. Die automatische Auswertung der Nachsuche ist technisch fehlgeschlagen (%s); keine zusätzliche Negativbewertung aus fehlender Auswertung." % (searched, exc.__class__.__name__)
+    if "Nachsuche:" not in revised:
+        revised = revised.strip() + "\nNachsuche: Gezielt gesucht mit: " + "; ".join(queries[:3])
+    elif not re.search(r"(?i)Gezielt\s+gesucht\s+(?:nach|mit)", revised):
+        revised = revised.strip() + "\nNachsuche: Gezielt gesucht mit: " + "; ".join(queries[:3])
+    return revised.strip(), searches, merged
+
+
 def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dict], sources: list[dict]) -> list[dict]:
     eval_dir = job_dir / "research" / "claim-evaluations"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -943,7 +1075,7 @@ def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dic
                 source_lines.append("[%d] %s | %s | %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:260]))
             (eval_dir / ("group-%02d-sources.json" % group_index)).write_text(json.dumps({"query": targeted_query, "sources": targeted_sources}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             if not source_lines:
-                text = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\nWarum: Für diese konkrete Aussage wurden keine passenden gezielten Quellen gefunden. Aus fehlenden Treffern darf nicht abgeleitet werden, dass die Aussage falsch oder unbelegt ist.\nQuellen: Keine ausreichenden gezielten Quellen in diesem Lauf.\nEinordnung: Die Aussage benötigt eine eigene aktuelle Quellenprüfung, bevor sie öffentlich als korrekt, falsch oder unbelegt bewertet wird.\nOffen: Manuelle oder erneute gezielte Recherche mit Primärquellen, aktuellen Nachrichten und thematisch passenden Fach-/Behördenquellen."
+                text = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\nWarum: Für diese konkrete Aussage wurden keine passenden gezielten Quellen gefunden. Aus fehlenden Treffern darf nicht abgeleitet werden, dass die Aussage falsch oder unbelegt ist.\nQuellen: Keine ausreichenden gezielten Quellen in diesem Lauf.\nEinordnung: Die Aussage benötigt eine eigene aktuelle Quellenprüfung, bevor sie öffentlich als korrekt, falsch oder unbelegt bewertet wird.\nNachsuche: Es wurde gezielt nach dem Aussagewortlaut gesucht; es wurden keine ausreichend passenden Treffer gefunden."
                 out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "evaluation": text.strip()}
                 evaluations.append(out)
                 (eval_dir / ("group-%02d.txt" % group_index)).write_text(text.strip() + "\n", encoding="utf-8")
@@ -964,13 +1096,17 @@ Bewertung: <Ampel + korrekt/falsch/teilweise/unbelegt/nicht pruefbar>
 Warum: <2-4 Saetze>
 Quellen: <welche Quellen stuetzen/widersprechen, kurz>
 Einordnung: <Zuspitzung/Kontext/Framing, kurz>
-Offen: <was fuer haertere Pruefung fehlt, kurz>
+Nachsuche: <welche gezielte Suche durchgefuehrt wurde; falls nicht ausreichend: genau das transparent sagen, ohne eine Hausaufgabe stehen zu lassen>
 """ % (claim_text, "; ".join(source_lines))
             try:
                 text = call_bifrost(settings, prompt, max_tokens=380)
             except Exception as exc:
-                text = "Bewertung: ⚫ Teilbewertung nicht verfuegbar\nWarum: Der einzelne openai/gpt-5.5-Bewertungsaufruf fuer diese Aussage ist technisch fehlgeschlagen (%s).\nQuellen: Nicht ausgewertet.\nEinordnung: Die Aussage wurde extrahiert, aber in diesem Lauf nicht bewertet.\nOffen: Erneuter Versuch oder manuelle Gegenpruefung." % exc.__class__.__name__
-            out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "evaluation": text.strip()}
+                text = "Bewertung: ⚫ Teilbewertung nicht verfuegbar\nWarum: Der einzelne openai/gpt-5.5-Bewertungsaufruf fuer diese Aussage ist technisch fehlgeschlagen (%s).\nQuellen: Nicht ausgewertet.\nEinordnung: Die Aussage wurde extrahiert, aber in diesem Lauf nicht bewertet.\nNachsuche: Erneuter automatischer Lauf oder manuelle Gegenpruefung erforderlich; keine Sachbewertung aus einem technischen Fehler ableiten." % exc.__class__.__name__
+            followup_searches: list[dict] = []
+            followup_sources: list[dict] = []
+            if evaluation_needs_followup(text):
+                text, followup_searches, followup_sources = followup_research_for_evaluation(job_dir, settings, group_index, claim_text, text)
+            out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "followup_searches": followup_searches, "followup_sources": followup_sources, "evaluation": text.strip()}
             evaluations.append(out)
             (eval_dir / ("group-%02d.txt" % group_index)).write_text(text.strip() + "\n", encoding="utf-8")
     (job_dir / "research" / "claim_evaluations.json").write_text(json.dumps(evaluations, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1088,7 +1224,8 @@ def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: lis
         "4. QUELLENLAGE",
         "",
     ])
-    for i, s in enumerate(sources[:8], 1):
+    combined_sources = merge_sources_unique([sources or [], *[(item.get("followup_sources") or []) for item in evaluations or []]], limit=12)
+    for i, s in enumerate(combined_sources[:12], 1):
         lines.append("[%d] %s" % (i, s.get("title") or "(ohne Titel)"))
         lines.append("URL: %s" % (s.get("url") or ""))
         excerpt = (s.get("content") or "")[:350]
