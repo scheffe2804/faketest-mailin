@@ -63,9 +63,13 @@ def add_meta_note(job_dir: Path, meta: dict, note: str) -> None:
     save_meta(job_dir, meta)
 
 
-def run_cmd(args: list[str], input_text: str | None = None, timeout: int = 60) -> subprocess.CompletedProcess:
+def run_cmd(args: list[str], input_text: str | None = None, timeout: int = 60, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    env = None
+    if env_extra:
+        env = os.environ.copy()
+        env.update(env_extra)
     try:
-        return subprocess.run(args, input=input_text, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        return subprocess.run(args, input=input_text, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False, env=env)
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or exc.output or ""
         stderr = exc.stderr or ""
@@ -165,14 +169,18 @@ def extract_pdf(path: Path, max_pages: int) -> tuple[str, str | None]:
 
 def extract_image(path: Path) -> tuple[str, str | None]:
     attempts = [
-        (["tesseract", str(path), "stdout", "-l", "deu+eng"], 90, "deu+eng"),
-        (["tesseract", str(path), "stdout", "-l", "deu"], 60, "deu"),
-        (["tesseract", str(path), "stdout", "-l", "eng"], 60, "eng"),
-        (["tesseract", str(path), "stdout", "-l", "deu+eng", "--psm", "6"], 60, "deu+eng psm6"),
+        (["tesseract", str(path), "stdout", "-l", "deu+eng", "--psm", "6"], 45, "deu+eng psm6"),
+        (["tesseract", str(path), "stdout", "-l", "deu", "--psm", "6"], 45, "deu psm6"),
+        (["tesseract", str(path), "stdout", "-l", "eng", "--psm", "6"], 45, "eng psm6"),
+        (["tesseract", str(path), "stdout", "-l", "deu+eng", "--psm", "11"], 45, "deu+eng psm11"),
+        (["tesseract", str(path), "stdout", "-l", "deu+eng"], 60, "deu+eng"),
     ]
     errors: list[str] = []
     for args, timeout, label in attempts:
-        proc = run_cmd(args, timeout=timeout)
+        # Tesseract can hang for minutes on some social-media JPEGs when OpenMP
+        # fans out too aggressively. Single-threaded OCR is more predictable for
+        # mail-in screenshots/sharepics and prevents false "no text" approvals.
+        proc = run_cmd(args, timeout=timeout, env_extra={"OMP_THREAD_LIMIT": "1"})
         text = (proc.stdout or "").strip()
         if proc.returncode == 0 and text:
             return text, None
