@@ -1591,7 +1591,8 @@ def markdownish_to_html(text: str) -> str:
             continue
         if re.match(r"^#{1,4}\s+", line):
             flush_paragraph(); close_list()
-            level = min(4, len(line) - len(line.lstrip("#")) + 1)
+            marker_level = len(line) - len(line.lstrip("#"))
+            level = min(4, marker_level + 2)
             title = re.sub(r"^#{1,4}\s+", "", line).strip()
             html_lines.append("<h%d>%s</h%d>" % (level, inline_public_html(title), level))
             continue
