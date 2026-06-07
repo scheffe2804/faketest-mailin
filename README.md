@@ -93,12 +93,21 @@ scripts/retry-publish.py <job-id> --reason "why this retry is safe"
 
 The worker has a first controlled video-processing path for video attachments and direct public video file URLs. It reads metadata with `ffprobe`, extracts audio with `ffmpeg`, then calls the configured `video.transcribe_command`. `host-tools/faketest-transcribe.py` is a wrapper for Whisper-compatible backends. If no backend is installed, the worker records an extraction warning instead of crashing.
 
+To prevent disk growth, extracted audio and downloaded video files are deleted after processing by default. Original video mail attachments are retained by default as part of the incoming job archive unless `delete_original_video_after_processing` is enabled.
+
 Platform/page downloads via `yt-dlp`, frame OCR and timestamped claim extraction are planned follow-up work.
 
 Install helper for a CPU-only `faster-whisper` runtime:
 
 ```bash
 scripts/install-faster-whisper.sh --prefix /opt/faketest-transcribe --model small
+```
+
+Check the deployed video runtime:
+
+```bash
+scripts/check-video-runtime.sh
+scripts/video-smoke-test.sh --model tiny
 ```
 
 ## Video fact-checking plan

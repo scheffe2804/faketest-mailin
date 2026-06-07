@@ -70,6 +70,22 @@ docker compose -f compose.yml -f compose.live.yml run --rm wpcli wpematico-searc
 scripts/wpematico-monitoring-snapshot.sh --profile live --format=json
 ```
 
+## Video runtime checks
+
+Check video/transcription readiness on m00h:
+
+```bash
+scripts/check-video-runtime.sh
+```
+
+Run a synthetic video extraction smoke test:
+
+```bash
+scripts/video-smoke-test.sh --model tiny
+```
+
+The smoke test uses a tone-only generated video. It is OK if no transcript is produced; the key requirements are: metadata is extracted, audio extraction runs, the transcription wrapper is invoked and no worker crash occurs.
+
 ## Settings permissions
 
 The worker runs as user/group `chris` on m00h. Runtime settings must be readable by that user, e.g.:

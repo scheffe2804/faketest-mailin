@@ -230,6 +230,22 @@ def summarize_video_metadata(path: Path, metadata: dict) -> str:
     return "\n".join(parts)
 
 
+def cleanup_video_artifact(path: Path | None, settings: dict, label: str = "Videoartefakt") -> str | None:
+    if path is None:
+        return None
+    cfg = settings.get("video", {})
+    if not bool(cfg.get("delete_media_after_processing", True)):
+        return None
+    try:
+        if path.exists() and path.is_file():
+            size = path.stat().st_size
+            path.unlink()
+            return "%s nach Verarbeitung geloescht: %s (%d Bytes)" % (label, path.name, size)
+    except Exception as exc:
+        return "%s konnte nicht geloescht werden: %s (%s)" % (label, path, exc.__class__.__name__)
+    return None
+
+
 def extract_video_audio(job_dir: Path, path: Path, settings: dict) -> tuple[Path | None, str | None]:
     cfg = settings.get("video", {})
     timeout = int(cfg.get("ffmpeg_timeout_seconds", 300) or 300)
@@ -272,16 +288,33 @@ def extract_video(job_dir: Path, path: Path, settings: dict) -> tuple[str, str |
     metadata_text = summarize_video_metadata(path, metadata)
     if duration is not None and duration > max_seconds:
         return "## Videometadaten\n%s" % metadata_text, "Video ist zu lang fuer automatische Transkription (%.1f Sekunden > %.1f Sekunden)" % (duration, max_seconds)
-    audio_path, audio_err = extract_video_audio(job_dir, path, settings)
-    if audio_err or audio_path is None:
-        return "## Videometadaten\n%s" % metadata_text, audio_err
-    transcript, transcript_err = transcribe_audio(audio_path, settings)
-    if transcript_err:
-        return "## Videometadaten\n%s" % metadata_text, transcript_err
-    max_chars = int(cfg.get("max_transcript_chars", 60000) or 60000)
-    if len(transcript) > max_chars:
-        transcript = transcript[:max_chars] + "\n\n[Transkript wegen Laengenlimit gekuerzt]"
-    return "## Videometadaten\n%s\n\n## Automatisches Transkript\n%s" % (metadata_text, transcript), None
+    audio_path: Path | None = None
+    cleanup_notes: list[str] = []
+    try:
+        audio_path, audio_err = extract_video_audio(job_dir, path, settings)
+        if audio_err or audio_path is None:
+            return "## Videometadaten\n%s" % metadata_text, audio_err
+        transcript, transcript_err = transcribe_audio(audio_path, settings)
+        if transcript_err:
+            return "## Videometadaten\n%s" % metadata_text, transcript_err
+        max_chars = int(cfg.get("max_transcript_chars", 60000) or 60000)
+        if len(transcript) > max_chars:
+            transcript = transcript[:max_chars] + "\n\n[Transkript wegen Laengenlimit gekuerzt]"
+        return "## Videometadaten\n%s\n\n## Automatisches Transkript\n%s" % (metadata_text, transcript), None
+    finally:
+        note = cleanup_video_artifact(audio_path, settings, "Extrahierte Audiodatei")
+        if note:
+            cleanup_notes.append(note)
+        if bool(cfg.get("delete_original_video_after_processing", False)):
+            note = cleanup_video_artifact(path, settings, "Original-/Download-Video")
+            if note:
+                cleanup_notes.append(note)
+        if cleanup_notes:
+            cleanup_log = job_dir / "extracted" / "video-cleanup.log"
+            cleanup_log.parent.mkdir(parents=True, exist_ok=True)
+            with cleanup_log.open("a", encoding="utf-8") as handle:
+                for line in cleanup_notes:
+                    handle.write("%s\n" % line)
 
 
 def extract_attachments(job_dir: Path, meta: dict, settings: dict) -> tuple[str, list[str]]:
@@ -503,7 +536,12 @@ def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict) -> d
     if proc.returncode != 0 or not target.exists() or target.stat().st_size == 0:
         item["error"] = "Video-Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
         return item
-    text, err = extract_video(job_dir, target, settings)
+    original_delete = bool(cfg.get("delete_original_video_after_processing", False))
+    cfg["delete_original_video_after_processing"] = bool(cfg.get("delete_downloaded_video_after_processing", True))
+    try:
+        text, err = extract_video(job_dir, target, settings)
+    finally:
+        cfg["delete_original_video_after_processing"] = original_delete
     if err:
         item["error"] = err
     if text:
@@ -554,7 +592,12 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
         item["error"] = "yt-dlp lieferte keine Videodatei"
         return item
     video_path = candidates[0]
-    text, err = extract_video(job_dir, video_path, settings)
+    original_delete = bool(cfg.get("delete_original_video_after_processing", False))
+    cfg["delete_original_video_after_processing"] = bool(cfg.get("delete_downloaded_video_after_processing", True))
+    try:
+        text, err = extract_video(job_dir, video_path, settings)
+    finally:
+        cfg["delete_original_video_after_processing"] = original_delete
     if err:
         item["error"] = err
     if text:

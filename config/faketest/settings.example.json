@@ -33,6 +33,9 @@
     "yt_dlp_enabled": false,
     "yt_dlp_command": "/opt/faketest-transcribe/venv/bin/yt-dlp",
     "yt_dlp_format": "bv*+ba/best",
+    "delete_media_after_processing": true,
+    "delete_downloaded_video_after_processing": true,
+    "delete_original_video_after_processing": false,
     "yt_dlp_allowed_hosts": [
       "youtube.com",
       "youtu.be",

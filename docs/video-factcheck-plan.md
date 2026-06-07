@@ -16,6 +16,14 @@ Implemented first step:
 
 The first implementation intentionally does **not** publish original video material, frames or thumbnails.
 
+By default, large media artifacts are removed after processing:
+
+- extracted audio is deleted after transcription attempt
+- downloaded direct/yt-dlp videos are deleted after analysis
+- original mail attachment videos are kept by default as part of the saved incoming job, but can be removed by setting `delete_original_video_after_processing=true`
+
+The worker keeps text artifacts such as metadata, transcripts and `video-cleanup.log`.
+
 ## Intended full pipeline
 
 1. Accept video attachment or public video URL.
