@@ -20,6 +20,17 @@
     "combined_text_chars": 80000,
     "source_excerpt_chars": 3000
   },
+  "video": {
+    "enabled": true,
+    "max_duration_seconds": 1800,
+    "max_audio_seconds": 1800,
+    "max_transcript_chars": 60000,
+    "max_download_bytes": 524288000,
+    "download_timeout_seconds": 180,
+    "ffmpeg_timeout_seconds": 300,
+    "transcribe_timeout_seconds": 900,
+    "transcribe_command": ""
+  },
   "retention_days": {
     "completed": 90,
     "failed": 30,
@@ -48,7 +59,7 @@
     "release_allow_update_changes": true,
     "release_empty_commit_message": "release Faktencheck: {title}"
   },
-  "allowed_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".txt"],
+  "allowed_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".txt", ".mp4", ".mov", ".m4v", ".webm", ".mkv"],
   "blocked_extensions": [".exe", ".scr", ".bat", ".cmd", ".com", ".js", ".vbs", ".ps1", ".sh", ".php", ".py", ".zip", ".rar", ".7z", ".tar", ".gz", ".docm", ".xlsm", ".pptm"],
   "virus_scan": {
     "enabled": true,

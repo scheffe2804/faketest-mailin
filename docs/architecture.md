@@ -37,6 +37,7 @@
 - Bifrost/LLM returned tool calls or timed out; worker now disables tool calls and streams responses.
 - Binary links from HTML mails were decoded as UTF-8; worker now skips likely binary URLs.
 - OCR via Tesseract timed out; worker now treats subprocess timeouts as normal command failures.
+- Video attachments/direct video file URLs are handled via `ffprobe`/`ffmpeg` plus a configurable transcription command. Missing video tooling or transcription yields extraction warnings, not worker crashes.
 - Live checks were previously attempted from the wrong host; Live checks must run on `publish.live_release_host`.
 - Release script merged a stale local `dev`; it must merge `origin/dev` into `main`.
 - Cloudflare may serve stale 404 after a successful Live promote; purge and re-check public URL.

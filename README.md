@@ -89,6 +89,12 @@ scripts/retry-publish.py <job-id> --reason "why this retry is safe"
 4. Worker creates/updates a Staging WordPress page under `/faktencheck/`.
 5. Worker runs checks, commits release trigger changes, merges to `main`, deploys/promotes to Live, purges cache, verifies Live.
 
+## Video fact-checking
+
+The worker has a first controlled video-processing path for video attachments and direct public video file URLs. It reads metadata with `ffprobe`, extracts audio with `ffmpeg`, then calls the configured `video.transcribe_command`. If transcription is not configured, the worker records an extraction warning instead of crashing.
+
+Platform/page downloads via `yt-dlp`, frame OCR and timestamped claim extraction are planned follow-up work.
+
 ## Video fact-checking plan
 
 Video support is planned as an extension. See `docs/video-factcheck-plan.md`.

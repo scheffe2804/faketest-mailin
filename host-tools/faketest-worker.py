@@ -186,6 +186,104 @@ def extract_image(path: Path) -> tuple[str, str | None]:
     return "", "Bild-OCR fehlgeschlagen (%s)" % "; ".join(errors[:4])
 
 
+VIDEO_SUFFIXES = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
+
+
+def video_metadata(path: Path, timeout: int = 45) -> tuple[dict, str | None]:
+    proc = run_cmd(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)], timeout=timeout)
+    if proc.returncode != 0:
+        return {}, "Video-Metadaten konnten nicht gelesen werden (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:200])
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except Exception as exc:
+        return {}, "Video-Metadaten ungueltig: %s" % exc
+    return data, None
+
+
+def video_duration_seconds(metadata: dict) -> float | None:
+    duration = str((metadata.get("format") or {}).get("duration") or "").strip()
+    try:
+        return float(duration)
+    except Exception:
+        return None
+
+
+def summarize_video_metadata(path: Path, metadata: dict) -> str:
+    fmt = metadata.get("format") or {}
+    streams = metadata.get("streams") or []
+    duration = video_duration_seconds(metadata)
+    parts = ["Datei: %s" % path.name]
+    if duration is not None:
+        parts.append("Dauer: %.1f Sekunden" % duration)
+    if fmt.get("format_name"):
+        parts.append("Container/Formate: %s" % fmt.get("format_name"))
+    for stream in streams:
+        codec_type = stream.get("codec_type") or "stream"
+        codec = stream.get("codec_name") or "unbekannt"
+        if codec_type == "video":
+            wh = ""
+            if stream.get("width") and stream.get("height"):
+                wh = " %sx%s" % (stream.get("width"), stream.get("height"))
+            parts.append("Videospur: %s%s" % (codec, wh))
+        elif codec_type == "audio":
+            parts.append("Audiospur: %s" % codec)
+    return "\n".join(parts)
+
+
+def extract_video_audio(job_dir: Path, path: Path, settings: dict) -> tuple[Path | None, str | None]:
+    cfg = settings.get("video", {})
+    timeout = int(cfg.get("ffmpeg_timeout_seconds", 300) or 300)
+    audio_dir = job_dir / "extracted" / "video-audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / (path.stem + ".wav")
+    proc = run_cmd([
+        "ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-t", str(int(cfg.get("max_audio_seconds", 1800) or 1800)), str(audio_path)
+    ], timeout=timeout)
+    if proc.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+        return None, "Audio konnte nicht aus Video extrahiert werden (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
+    return audio_path, None
+
+
+def transcribe_audio(audio_path: Path, settings: dict) -> tuple[str, str | None]:
+    cfg = settings.get("video", {})
+    command_template = str(cfg.get("transcribe_command") or "").strip()
+    if not command_template:
+        return "", "Keine Video-Transkription konfiguriert (video.transcribe_command fehlt)"
+    timeout = int(cfg.get("transcribe_timeout_seconds", 900) or 900)
+    command = command_template.format(audio=shell_quote(str(audio_path)), audio_path=shell_quote(str(audio_path)))
+    proc = run_cmd(["bash", "-lc", command], timeout=timeout)
+    if proc.returncode != 0:
+        return "", "Video-Transkription fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
+    text = (proc.stdout or "").strip()
+    if not text:
+        return "", "Video-Transkription lieferte keinen Text"
+    return text, None
+
+
+def extract_video(job_dir: Path, path: Path, settings: dict) -> tuple[str, str | None]:
+    cfg = settings.get("video", {})
+    if not bool(cfg.get("enabled", True)):
+        return "", "Video-Verarbeitung ist deaktiviert"
+    metadata, meta_err = video_metadata(path)
+    if meta_err:
+        return "", meta_err
+    duration = video_duration_seconds(metadata)
+    max_seconds = float(cfg.get("max_duration_seconds", 1800) or 1800)
+    metadata_text = summarize_video_metadata(path, metadata)
+    if duration is not None and duration > max_seconds:
+        return "## Videometadaten\n%s" % metadata_text, "Video ist zu lang fuer automatische Transkription (%.1f Sekunden > %.1f Sekunden)" % (duration, max_seconds)
+    audio_path, audio_err = extract_video_audio(job_dir, path, settings)
+    if audio_err or audio_path is None:
+        return "## Videometadaten\n%s" % metadata_text, audio_err
+    transcript, transcript_err = transcribe_audio(audio_path, settings)
+    if transcript_err:
+        return "## Videometadaten\n%s" % metadata_text, transcript_err
+    max_chars = int(cfg.get("max_transcript_chars", 60000) or 60000)
+    if len(transcript) > max_chars:
+        transcript = transcript[:max_chars] + "\n\n[Transkript wegen Laengenlimit gekuerzt]"
+    return "## Videometadaten\n%s\n\n## Automatisches Transkript\n%s" % (metadata_text, transcript), None
+
+
 def extract_attachments(job_dir: Path, meta: dict, settings: dict) -> tuple[str, list[str]]:
     extracted_dir = job_dir / "extracted"
     extracted_dir.mkdir(exist_ok=True)
@@ -216,6 +314,8 @@ def extract_attachments(job_dir: Path, meta: dict, settings: dict) -> tuple[str,
                 text, err = extract_pdf(path, int(limits["pdf_pages_per_file"]))
         elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}:
             text, err = extract_image(path)
+        elif suffix in VIDEO_SUFFIXES:
+            text, err = extract_video(job_dir, path, settings)
         elif suffix == ".txt":
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -383,6 +483,35 @@ def extract_urls(text: str) -> list[str]:
     return urls
 
 
+def is_likely_video_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url or "")
+    suffix = Path(parsed.path or "").suffix.lower()
+    return suffix in VIDEO_SUFFIXES
+
+
+def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict) -> dict:
+    cfg = settings.get("video", {})
+    video_dir = job_dir / "research" / "direct-videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    parsed = urllib.parse.urlparse(url)
+    suffix = Path(parsed.path or "").suffix.lower() or ".mp4"
+    target = video_dir / ("video-%02d%s" % (index, suffix))
+    max_bytes = int(cfg.get("max_download_bytes", settings.get("limits", {}).get("attachment_bytes", 15728640)) or 15728640)
+    timeout = int(cfg.get("download_timeout_seconds", 180) or 180)
+    proc = run_cmd(["curl", "-sS", "-L", "--max-time", str(timeout), "--max-filesize", str(max_bytes), "-A", "Faketest/1.0", "-o", str(target), url], timeout=timeout + 30)
+    item = {"url": url, "ok": False, "title": "", "text": "", "error": "", "kind": "video"}
+    if proc.returncode != 0 or not target.exists() or target.stat().st_size == 0:
+        item["error"] = "Video-Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
+        return item
+    text, err = extract_video(job_dir, target, settings)
+    if err:
+        item["error"] = err
+    if text:
+        item.update({"ok": True, "title": "Direktes Video", "text": "Direkt verlinktes Video: %s\n\n%s" % (url, text)})
+        (video_dir / ("video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
+    return item
+
+
 def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[dict]:
     out: list[dict] = []
     direct_dir = job_dir / "research" / "direct-links"
@@ -391,6 +520,9 @@ def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[d
     max_chars = 20000
     for index, url in enumerate(urls[:limit], 1):
         item = {"url": url, "ok": False, "title": "", "text": "", "error": ""}
+        if is_likely_video_url(url):
+            out.append(fetch_direct_video(job_dir, url, index, settings))
+            continue
         if is_likely_binary_url(url):
             item["error"] = "binary/asset URL skipped"
             out.append(item)
@@ -969,6 +1101,7 @@ Regeln:
 - Quellen wurden automatisch per Websuche gefunden, nicht vom Nutzer vorgegeben und nicht vorab als gesichert festgelegt.
 - Verwende nicht die Formulierungen "gesicherte Quellen", "zugelassene Quellen" oder "vom Nutzer vorgegebene Quellen".
 - Bei Bildern/OCR: pruefe den Tatsachenkern auch dann, wenn einzelne Zeichen falsch erkannt wurden.
+- Bei Videos/Transkripten: Nutze Zeit-/Videokontext, falls vorhanden. Veröffentliche oder reproduziere keine fremden Videos, Frames oder Vorschaubilder; arbeite mit Beschreibung, Transkript-Auszügen und Quellen.
 - Wenn Quellen nicht zum Inhalt passen, sage das klar.
 - Die Gesamtbewertung muss direkt nach dem Kurzfazit stehen, nicht erst am Ende.
 
