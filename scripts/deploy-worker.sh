@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_HOST="${TARGET_HOST:-m00h}"
 WORKER_SRC="$REPO_ROOT/host-tools/faketest-worker.py"
 CLEANUP_SRC="$REPO_ROOT/host-tools/faketest-cleanup.py"
+TRANSCRIBE_SRC="$REPO_ROOT/host-tools/faketest-transcribe.py"
 SETTINGS_SRC="$REPO_ROOT/config/faketest/settings.json"
 
 DEPLOY_SETTINGS=0
@@ -64,9 +65,10 @@ done
 
 [[ -f "$WORKER_SRC" ]] || { echo "Missing worker: $WORKER_SRC" >&2; exit 1; }
 [[ -f "$CLEANUP_SRC" ]] || { echo "Missing cleanup: $CLEANUP_SRC" >&2; exit 1; }
+[[ -f "$TRANSCRIBE_SRC" ]] || { echo "Missing transcribe wrapper: $TRANSCRIBE_SRC" >&2; exit 1; }
 
 echo "== Local syntax checks =="
-python3 -m py_compile "$WORKER_SRC" "$CLEANUP_SRC"
+python3 -m py_compile "$WORKER_SRC" "$CLEANUP_SRC" "$TRANSCRIBE_SRC"
 
 if [[ "$DEPLOY_SETTINGS" -eq 1 ]]; then
   [[ -f "$SETTINGS_SRC" ]] || { echo "Missing real settings: $SETTINGS_SRC" >&2; exit 1; }
@@ -78,6 +80,7 @@ tmp_base="/tmp/faketest-deploy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 echo "== Copy scripts to $TARGET_HOST =="
 scp "$WORKER_SRC" "$TARGET_HOST:$tmp_base-worker.py"
 scp "$CLEANUP_SRC" "$TARGET_HOST:$tmp_base-cleanup.py"
+scp "$TRANSCRIBE_SRC" "$TARGET_HOST:$tmp_base-transcribe.py"
 
 if [[ "$DEPLOY_SETTINGS" -eq 1 ]]; then
   scp "$SETTINGS_SRC" "$TARGET_HOST:$tmp_base-settings.json"
@@ -93,6 +96,7 @@ echo "== Install on $TARGET_HOST =="
 ssh "$TARGET_HOST" "set -euo pipefail
 sudo install -m 0755 '$tmp_base-worker.py' /usr/local/sbin/faketest-worker.py
 sudo install -m 0755 '$tmp_base-cleanup.py' /usr/local/sbin/faketest-cleanup.py
+sudo install -m 0755 '$tmp_base-transcribe.py' /usr/local/sbin/faketest-transcribe.py
 if [[ '$DEPLOY_SETTINGS' -eq 1 ]]; then
   sudo install -m 0640 -o root -g chris '$tmp_base-settings.json' /etc/faketest/settings.json
   if [[ -e /srv/mailin/config/faketest ]]; then
@@ -107,7 +111,7 @@ if [[ '$DEPLOY_UNITS' -eq 1 ]]; then
 fi
 python3 - <<'PY'
 import py_compile, tempfile
-for src in ['/usr/local/sbin/faketest-worker.py', '/usr/local/sbin/faketest-cleanup.py']:
+for src in ['/usr/local/sbin/faketest-worker.py', '/usr/local/sbin/faketest-cleanup.py', '/usr/local/sbin/faketest-transcribe.py']:
     c = tempfile.NamedTemporaryFile(prefix='faketest-', suffix='.pyc', delete=False).name
     py_compile.compile(src, cfile=c, doraise=True)
     print('syntax ok', src, c)

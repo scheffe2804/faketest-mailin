@@ -91,7 +91,7 @@ scripts/retry-publish.py <job-id> --reason "why this retry is safe"
 
 ## Video fact-checking
 
-The worker has a first controlled video-processing path for video attachments and direct public video file URLs. It reads metadata with `ffprobe`, extracts audio with `ffmpeg`, then calls the configured `video.transcribe_command`. If transcription is not configured, the worker records an extraction warning instead of crashing.
+The worker has a first controlled video-processing path for video attachments and direct public video file URLs. It reads metadata with `ffprobe`, extracts audio with `ffmpeg`, then calls the configured `video.transcribe_command`. `host-tools/faketest-transcribe.py` is a wrapper for Whisper-compatible backends. If no backend is installed, the worker records an extraction warning instead of crashing.
 
 Platform/page downloads via `yt-dlp`, frame OCR and timestamped claim extraction are planned follow-up work.
 

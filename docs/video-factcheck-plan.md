@@ -10,7 +10,7 @@ Implemented first step:
 2. Accept direct public video file URLs with the same extensions.
 3. Inspect metadata with `ffprobe`.
 4. Extract mono 16 kHz WAV audio with `ffmpeg`.
-5. Call a configurable transcription command via `video.transcribe_command`.
+5. Call a configurable transcription command via `video.transcribe_command`, typically `faketest-transcribe.py`.
 6. Feed video metadata and transcript into the normal Faketest pipeline.
 7. If video tools or transcription are missing, return an extraction warning instead of crashing the worker.
 
@@ -60,15 +60,21 @@ Suggested first version:
 
 `video.transcribe_command` is a shell command template. The worker substitutes `{audio}` and `{audio_path}` with a shell-quoted WAV path.
 
-Example using a local Whisper CLI wrapper:
+Recommended wrapper command:
 
 ```json
 "video": {
-  "transcribe_command": "whisper --language German --model small --output_format txt --output_dir /tmp {audio} && cat /tmp/$(basename {audio_path} .wav).txt"
+  "transcribe_command": "python3 /usr/local/sbin/faketest-transcribe.py --language de --model small --timeout 900 {audio}"
 }
 ```
 
-The exact command depends on the installed transcription tool. Keep it deterministic and ensure it writes transcript text to stdout.
+The wrapper tries a custom command first if configured via `FAKETEST_TRANSCRIBE_COMMAND`, then known local backends:
+
+- `whisper`
+- `whisper-ctranslate2`
+- `whisper-cli` / `whisper.cpp` / `main`
+
+The exact backend still has to be installed on the runtime host. The wrapper writes transcript text to stdout and diagnostics to stderr.
 
 ## Phase 2 candidates
 
