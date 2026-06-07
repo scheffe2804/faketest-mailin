@@ -580,6 +580,19 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
     max_bytes = int(cfg.get("max_download_bytes", settings.get("limits", {}).get("attachment_bytes", 15728640)) or 15728640)
     timeout = int(cfg.get("download_timeout_seconds", 180) or 180)
     ytdlp = str(cfg.get("yt_dlp_command") or "yt-dlp")
+    metadata: dict = {}
+    metadata_proc = run_cmd([ytdlp, "--no-playlist", "--skip-download", "--dump-json", url], timeout=90)
+    if metadata_proc.returncode == 0 and (metadata_proc.stdout or "").strip():
+        try:
+            metadata = json.loads((metadata_proc.stdout or "").splitlines()[-1])
+            (video_dir / ("page-video-%02d.info.json" % index)).write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            metadata = {}
+
+    channel = str(metadata.get("channel") or metadata.get("uploader") or metadata.get("uploader_id") or "").strip()
+    video_title = str(metadata.get("title") or "").strip()
+    display_title = " - ".join(part for part in (channel, video_title) if part) or "Video-Seite"
+
     command = [
         ytdlp,
         "--no-playlist",
@@ -590,7 +603,7 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
         "--output", str(target_template),
         url,
     ]
-    item = {"url": url, "ok": False, "title": "", "text": "", "error": "", "kind": "video-page"}
+    item = {"url": url, "ok": False, "title": display_title, "video_title": video_title, "channel": channel, "text": "", "error": "", "kind": "video-page"}
     proc = run_cmd(command, timeout=timeout + 120)
     if proc.returncode != 0:
         item["error"] = "yt-dlp Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:400])
@@ -609,7 +622,7 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
     if err:
         item["error"] = err
     if text:
-        item.update({"ok": True, "title": "Video-Seite", "text": "Öffentlich verlinkte Video-Seite: %s\nLokale Analyse-Datei: %s\n\n%s" % (url, video_path.name, text)})
+        item.update({"ok": True, "title": display_title, "text": "Öffentlich verlinkte Video-Seite: %s\nTitel: %s\nLokale Analyse-Datei: %s\n\n%s" % (url, display_title, video_path.name, text)})
         (video_dir / ("page-video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
     return item
 
@@ -755,9 +768,6 @@ def split_claim_bullets(claim_text: str) -> list[str]:
 def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dict], sources: list[dict]) -> list[dict]:
     eval_dir = job_dir / "research" / "claim-evaluations"
     eval_dir.mkdir(parents=True, exist_ok=True)
-    source_lines = []
-    for i, s in enumerate(sources[:4], 1):
-        source_lines.append("[%d] %s | %s | %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:160]))
     evaluations: list[dict] = []
     group_index = 0
     for item in direct_claims or []:
@@ -767,9 +777,29 @@ def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dic
             if not group:
                 continue
             group_index += 1
+            claim_text = "; ".join(group)
+            targeted_query = re.sub(r"\s+", " ", claim_text).strip()[:500]
+            targeted_sources = search_web(settings, targeted_query) if targeted_query else []
+            source_lines = []
+            for i, s in enumerate((targeted_sources or [])[:5], 1):
+                source_lines.append("[%d] %s | %s | %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:260]))
+            (eval_dir / ("group-%02d-sources.json" % group_index)).write_text(json.dumps({"query": targeted_query, "sources": targeted_sources}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            if not source_lines:
+                text = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\nWarum: Für diese konkrete Aussage wurden keine passenden gezielten Quellen gefunden. Aus fehlenden Treffern darf nicht abgeleitet werden, dass die Aussage falsch oder unbelegt ist.\nQuellen: Keine ausreichenden gezielten Quellen in diesem Lauf.\nEinordnung: Die Aussage benötigt eine eigene aktuelle Quellenprüfung, bevor sie öffentlich als korrekt, falsch oder unbelegt bewertet wird.\nOffen: Manuelle oder erneute gezielte Recherche mit Primärquellen, aktuellen Nachrichten und thematisch passenden Fach-/Behördenquellen."
+                out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "evaluation": text.strip()}
+                evaluations.append(out)
+                (eval_dir / ("group-%02d.txt" % group_index)).write_text(text.strip() + "\n", encoding="utf-8")
+                continue
             prompt = """Aussage aus direkt verlinktem Artikel: %s
 
-Automatische Quellen (nicht vorab gesichert): %s
+Gezielte Quellen nur fuer genau diese Aussage: %s
+
+Wichtige Regeln:
+- Bewerte diese Aussage nur anhand der gezielten Quellen oben und des konkreten Aussagewortlauts.
+- Verwechsle niemals "in diesen Quellen nicht gefunden" mit "falsch" oder "unbelegt".
+- Wenn die gezielten Quellen thematisch nicht passen oder nicht aktuell genug sind, schreibe: "In diesem automatischen Lauf nicht ausreichend geprüft".
+- Bei aktuellen Lagebehauptungen (z. B. Krieg, Schifffahrt, Energie, Preise, Behörden-/Gerichtsentscheidungen) muss der Zeitpunkt/Stand der Prüfung ausdrücklich berücksichtigt werden.
+- Erfinde keine Timecodes oder Zeitabschnitte. Nutze Zeitangaben nur, wenn sie im Material/Transkript wirklich vorhanden sind.
 
 Antworte exakt in diesen 5 kurzen Zeilen, aber mit echtem Inhalt:
 Bewertung: <Ampel + korrekt/falsch/teilweise/unbelegt/nicht pruefbar>
@@ -777,12 +807,12 @@ Warum: <2-4 Saetze>
 Quellen: <welche Quellen stuetzen/widersprechen, kurz>
 Einordnung: <Zuspitzung/Kontext/Framing, kurz>
 Offen: <was fuer haertere Pruefung fehlt, kurz>
-""" % ("; ".join(group), "; ".join(source_lines) or "Keine Quellen gefunden")
+""" % (claim_text, "; ".join(source_lines))
             try:
                 text = call_bifrost(settings, prompt, max_tokens=380)
             except Exception as exc:
                 text = "Bewertung: ⚫ Teilbewertung nicht verfuegbar\nWarum: Der einzelne openai/gpt-5.5-Bewertungsaufruf fuer diese Aussage ist technisch fehlgeschlagen (%s).\nQuellen: Nicht ausgewertet.\nEinordnung: Die Aussage wurde extrahiert, aber in diesem Lauf nicht bewertet.\nOffen: Erneuter Versuch oder manuelle Gegenpruefung." % exc.__class__.__name__
-            out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "evaluation": text.strip()}
+            out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "evaluation": text.strip()}
             evaluations.append(out)
             (eval_dir / ("group-%02d.txt" % group_index)).write_text(text.strip() + "\n", encoding="utf-8")
     (job_dir / "research" / "claim_evaluations.json").write_text(json.dumps(evaluations, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -825,6 +855,7 @@ Extrahierte Behauptungen:
 
 def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: list[dict], evaluations: list[dict], intent_analysis: str, sources: list[dict]) -> str:
     lines: list[str] = []
+    checked_at = str(meta.get("received_at") or "")[:10] or now_utc().date().isoformat()
     checked_claims = sum(1 for item in evaluations or [] if (item.get("evaluation") or "").strip())
     claim_count = sum(len(split_claim_bullets(item.get("claims", ""))[:12]) for item in direct_claims or [])
     lines.extend([
@@ -869,6 +900,10 @@ def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: lis
     ])
     for i, item in enumerate(evaluations or [], 1):
         lines.append("Block %d:" % i)
+        claims = [re.sub(r"\s+", " ", str(claim)).strip() for claim in (item.get("claims") or []) if str(claim).strip()]
+        if claims:
+            lines.append("Aussage: " + "; ".join(claims))
+        lines.append("Stand der Prüfung: " + checked_at)
         lines.append(item.get("evaluation", "").strip() or "Keine Bewertung erzeugt.")
         lines.append("")
         lines.append("---")
@@ -1298,6 +1333,29 @@ def first_ocr_sentence_title(job_dir: Path, meta: dict) -> str:
 
 def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None) -> str:
     if job_dir is not None:
+        direct_links_path = job_dir / "research" / "direct_links.json"
+        if direct_links_path.exists():
+            try:
+                direct_links = json.loads(direct_links_path.read_text(encoding="utf-8"))
+            except Exception:
+                direct_links = []
+            for item in direct_links if isinstance(direct_links, list) else []:
+                if str(item.get("kind") or "") not in {"video-page", "video"}:
+                    continue
+                channel = str(item.get("channel") or "").strip()
+                video_title = str(item.get("video_title") or "").strip()
+                if not video_title:
+                    raw_title = str(item.get("title") or "").strip()
+                    if " - " in raw_title:
+                        maybe_channel, maybe_title = raw_title.split(" - ", 1)
+                        channel = channel or maybe_channel.strip()
+                        video_title = maybe_title.strip()
+                    else:
+                        video_title = raw_title
+                if video_title:
+                    source = (channel + " - " + video_title).strip(" -") if channel else video_title
+                    return limit_factcheck_title("Faktencheck: " + source)
+    if job_dir is not None:
         ocr_title = first_ocr_sentence_title(job_dir, meta)
         if ocr_title:
             return limit_factcheck_title(ocr_title)
@@ -1368,6 +1426,7 @@ PUBLIC_LABELS = (
     "Absicht",
     "Kritischer Befund",
     "Aussage",
+    "Stand der Prüfung",
     "Bewertung",
     "Warum",
     "Quellenbezug",
@@ -1421,6 +1480,8 @@ def format_factcheck_detail_text(value: str) -> str:
 
 def format_factcheck_detail_html(value: str) -> str:
     rendered = inline_public_html(format_factcheck_detail_text(value)).replace("\n", "<br />\n")
+    rendered = re.sub(r"(?im)^(Direktlink\s+\d+\s*:)", r"<strong>\1</strong>", rendered)
+    rendered = re.sub(r"(?im)^(Block\s+\d+\s*:)", r"<strong>\1</strong>", rendered)
     for label in PUBLIC_LABELS:
         rendered = re.sub(r"(?<!<strong>)(%s\s*:)(?!</strong>)" % label, r"<strong>\1</strong>", rendered)
     rendered = re.sub(
