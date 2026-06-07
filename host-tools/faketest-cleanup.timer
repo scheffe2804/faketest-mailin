@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily cleanup of Faketest mail archives
+
+[Timer]
+OnCalendar=*-*-* 03:37:00
+Persistent=true
+Unit=faketest-cleanup.service
+
+[Install]
+WantedBy=timers.target

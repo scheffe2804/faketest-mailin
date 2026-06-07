@@ -1,0 +1,32 @@
+[Unit]
+Description=Cleanup old Faketest mail archives
+
+[Service]
+Type=oneshot
+User=chris
+Group=chris
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/tailshare/Faketest-Mails
+ReadOnlyPaths=/etc/faketest
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @raw-io @reboot @mount @swap @obsolete @debug @module @cpu-emulation @clock
+UMask=0077
+ExecStart=/usr/local/sbin/faketest-cleanup.py

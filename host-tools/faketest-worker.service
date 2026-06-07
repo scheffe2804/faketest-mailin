@@ -1,0 +1,33 @@
+[Unit]
+Description=Faketest mail worker
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=chris
+Group=chris
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/tailshare/Faketest-Mails /home/chris/web/staging.afd-im-netz.de /home/chris/.ssh
+ReadOnlyPaths=/etc/faketest /home/chris/.config/opencode
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @raw-io @reboot @mount @swap @obsolete @debug @module @cpu-emulation @clock
+UMask=0077
+ExecStart=/usr/local/sbin/faketest-worker.py

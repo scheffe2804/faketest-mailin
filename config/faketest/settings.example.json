@@ -1,0 +1,68 @@
+{
+  "address": "faketest@example.org",
+  "copy_bcc": "operator@example.org",
+  "allowed_senders": [
+    "operator@example.org"
+  ],
+  "base_dir": "/srv/tailshare/Faketest-Mails",
+  "limits": {
+    "message_bytes": 26214400,
+    "attachment_bytes": 15728640,
+    "attachments_per_mail": 5,
+    "pdf_pages_per_file": 20,
+    "pdf_pages_per_mail": 40,
+    "search_queries_per_job": 5,
+    "sources_per_job": 10,
+    "gpt_calls_per_job": 2,
+    "jobs_per_sender_per_hour": 3,
+    "jobs_per_sender_per_day": 0,
+    "global_parallel_jobs": 3,
+    "combined_text_chars": 80000,
+    "source_excerpt_chars": 3000
+  },
+  "retention_days": {
+    "completed": 90,
+    "failed": 30,
+    "expired_approval": 30,
+    "logs": 90,
+    "rate_state": 14
+  },
+  "approval_valid_days": 7,
+  "publish": {
+    "enabled": true,
+    "allowed_sender": "operator@example.org",
+    "token_valid_days": 30,
+    "staging_dir": "/home/example/web/staging.example.org",
+    "live_dir": "/home/example/web/example.org",
+    "staging_url": "https://staging.example.org",
+    "live_url": "https://example.org",
+    "live_release_host": "live-host-or-tailscale-ip",
+    "staging_host_header": "staging.example.org",
+    "live_host_header": "example.org",
+    "staging_local_url": "http://127.0.0.1:20001",
+    "live_local_url": "http://127.0.0.1:20000",
+    "parent_slug": "faktencheck",
+    "parent_title": "Faktencheck",
+    "menu_title": "Faktencheck",
+    "release_enabled": true,
+    "release_allow_update_changes": true,
+    "release_empty_commit_message": "release Faktencheck: {title}"
+  },
+  "allowed_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".txt"],
+  "blocked_extensions": [".exe", ".scr", ".bat", ".cmd", ".com", ".js", ".vbs", ".ps1", ".sh", ".php", ".py", ".zip", ".rar", ".7z", ".tar", ".gz", ".docm", ".xlsm", ".pptm"],
+  "virus_scan": {
+    "enabled": true,
+    "command": "clamscan",
+    "fail_closed": true,
+    "timeout_seconds": 120
+  },
+  "smtp": {
+    "host": "smtp-or-relay-host",
+    "port": 25
+  },
+  "search_url": "https://search.example.org/search",
+  "bifrost": {
+    "model": "openai/gpt-5.5",
+    "opencode_config": "/home/example/.config/opencode/opencode.json"
+  }
+}

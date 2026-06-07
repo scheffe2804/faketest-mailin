@@ -1,0 +1,43 @@
+services:
+  mailin-postfix:
+    build:
+      context: ./postfix
+    container_name: mailin-postfix
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MAIL_DOMAIN: m00h.eu
+      MAIL_DOMAINS: m00h.eu darkandalternativeworld.de
+      MAIL_HOSTNAME: mail.m00h.eu
+      PUBLIC_IP: 217.154.214.218
+      PUBLIC_IPV6: 2a01:239:42c:3d00::1
+      RELAYHOST: "[100.80.163.30]:25"
+      TLS_CERT_FILE: /certs/fullchain.pem
+      TLS_KEY_FILE: /certs/privkey.pem
+      MESSAGE_SIZE_LIMIT: "26214400"
+    volumes:
+      - /srv/mailin/config/postfix:/config:ro
+      - /srv/mailin/config/faketest:/etc/faketest:ro
+      - /srv/mailin/router:/opt/mail-router:ro
+      - /srv/mailin/archive:/srv/mailin/archive
+      - /srv/tailshare/MBDS Kasse 2026/Belege:/srv/mbds-belege
+      - /srv/tailshare/Ki-Mails:/srv/tailshare/Ki-Mails
+      - /srv/tailshare/Faketest-Mails:/srv/tailshare/Faketest-Mails
+      - /srv/mailin/certs:/certs:ro
+
+  mailin-dovecot:
+    build:
+      context: ./dovecot
+    container_name: mailin-dovecot
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MAIL_HOSTNAME: mail.m00h.eu
+      PUBLIC_IP: 217.154.214.218
+      PUBLIC_IPV6: 2a01:239:42c:3d00::1
+      TLS_CERT_FILE: /certs/fullchain.pem
+      TLS_KEY_FILE: /certs/privkey.pem
+    volumes:
+      - /srv/mailin/config/dovecot:/config:ro
+      - /srv/mailin/vmail:/srv/vmail
+      - /srv/mailin/certs:/certs:ro

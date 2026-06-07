@@ -1,0 +1,46 @@
+# Secrets / local runtime configuration
+.env
+.env.*
+*.secret
+*.secrets
+*credentials*
+*private-key*
+*privkey*
+config/faketest/settings.json
+
+# Runtime data and archives
+backups/
+archive/
+archives/
+logs/
+state/
+tmp/
+certs/
+vmail/
+
+# Faketest job/mail data must never be versioned
+Faketest-Mails/
+Ki-Mails/
+*.eml
+*.mbox
+attachments/
+extracted/
+result/
+research/
+publish/
+
+# Python/editor artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+*~

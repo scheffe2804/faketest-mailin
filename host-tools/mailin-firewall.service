@@ -1,0 +1,12 @@
+[Unit]
+Description=Open inbound mail ports in nftables
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mailin-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

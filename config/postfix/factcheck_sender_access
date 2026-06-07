@@ -1,0 +1,4 @@
+/^chrisheidingsfelder@gmail\.com$/i OK
+/^chris@m00h\.eu$/i OK
+/^elmar\.schulte@t-online\.de$/i OK
+/^.*$/ REJECT Sender not authorized for faketest@m00h.eu. Freischaltung: chrisheidingsfelder@gmail.com

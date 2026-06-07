@@ -1,0 +1,3 @@
+/^chrisheidingsfelder@gmail\.com$/i OK
+/^chris@m00h\.eu$/i OK
+/^.*$/ REJECT Sender not authorized for ki@m00h.eu. Freischaltung: chrisheidingsfelder@gmail.com
