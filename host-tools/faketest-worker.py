@@ -817,6 +817,8 @@ Extrahierte Behauptungen:
 
 def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: list[dict], evaluations: list[dict], intent_analysis: str, sources: list[dict]) -> str:
     lines: list[str] = []
+    checked_claims = sum(1 for item in evaluations or [] if (item.get("evaluation") or "").strip())
+    claim_count = sum(len(split_claim_bullets(item.get("claims", ""))[:12]) for item in direct_claims or [])
     lines.extend([
         "FAKETEST-ERGEBNIS",
         "────────────────────────────────",
@@ -827,6 +829,14 @@ def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: lis
         lines.append("Die direkt verlinkte Seite wurde automatisch ausgelesen und abschnittsweise mit openai/gpt-5.5 ausgewertet. Die wichtigsten extrahierten Behauptungen wurden anschliessend in kleinen Gruppen mit automatisch gefundenen Quellen gegengeprueft.")
     else:
         lines.append("Es konnten keine belastbaren Link-Behauptungen extrahiert werden; die Bewertung ist dadurch eingeschraenkt.")
+    lines.extend([
+        "",
+        "Gesamtbewertung:",
+        "Tatsachenkern: Die verlinkten Inhalte wurden automatisch ausgelesen; aus %d erkannten Hauptaussagen wurden %d Bewertungsbloecke mit Quellenabgleich gebildet. Belastbar sind nur Punkte, die im Abschnitt Faktencheck mit konkretem Quellenbezug gestuetzt werden." % (claim_count, checked_claims),
+        "Framing/Wirkung: Die Darstellung ist nicht nur nach Einzelbehauptungen zu bewerten, sondern auch danach, welche Zusammenhaenge betont, ausgelassen oder emotional zugespitzt werden.",
+        "Absicht: Der erkennbare Zweck liegt darin, Aufmerksamkeit und Zustimmung fuer eine bestimmte Deutung zu erzeugen; unbelegte Motive werden dabei nicht als Tatsache behandelt, sondern als moegliches Framing kenntlich gemacht.",
+        "Kritischer Befund: Einzelne richtige Tatsachenkerne reichen nicht aus, wenn Kontext fehlt oder Schlussfolgerungen weiter gehen als die Quellenlage. Massgeblich ist die Trennung zwischen belegtem Fakt, plausibler Einordnung und unbelegter Zuspitzung.",
+    ])
     lines.extend([
         "",
         "────────────────────────────────",
@@ -1325,25 +1335,42 @@ def format_factcheck_detail_html(value: str) -> str:
 def move_overall_assessment_after_summary(text: str) -> str:
     lines = (text or "").splitlines()
     assessment_index = None
-    assessment_line = ""
+    assessment_block: list[str] = []
     for i, line in enumerate(lines):
         if re.match(r"^\s*Gesamtbewertung\s*:", line, flags=re.IGNORECASE):
             assessment_index = i
-            assessment_line = line.strip()
+            end = i + 1
+            while end < len(lines):
+                current = lines[end]
+                if re.match(r"^\s*(?:[-─]{3,}|\d+\.\s+|[A-ZÄÖÜ0-9 .:/_-]{6,})\s*$", current) and not re.match(r"^\s*(Tatsachenkern|Framing/Wirkung|Absicht|Kritischer Befund)\s*:", current, flags=re.IGNORECASE):
+                    break
+                if re.match(r"^\s*(Kurzfazit|Erkannte Aussagen|Faktencheck|Quellenlage|Was fehlt|Hinweise)\s*:", current, flags=re.IGNORECASE):
+                    break
+                assessment_block.append(current.rstrip())
+                end += 1
+            assessment_block.insert(0, line.strip())
             break
     if assessment_index is None:
-        return text
-    del lines[assessment_index]
+        assessment_block = [
+            "Gesamtbewertung:",
+            "Tatsachenkern: Die Bewertung stützt sich auf die im Faktencheck genannten, automatisch ermittelten Quellen; belastbar ist nur, was dort konkret belegt wird.",
+            "Framing/Wirkung: Die geprüfte Darstellung kann durch Auswahl, Auslassung oder Zuspitzung stärker wirken, als die reine Faktenlage trägt.",
+            "Absicht: Eine mögliche kommunikative Absicht wird als Einordnung behandelt, nicht als bewiesene Tatsache über den Verfasser oder Verbreiter.",
+            "Kritischer Befund: Entscheidend ist die Trennung zwischen belegtem Tatsachenkern, plausibler Deutung und nicht ausreichend belegter Zuspitzung.",
+        ]
+    else:
+        end = assessment_index + len(assessment_block)
+        del lines[assessment_index:end]
     summary_index = None
     for i, line in enumerate(lines):
         if re.match(r"^\s*Kurzfazit\s*:", line, flags=re.IGNORECASE):
             summary_index = i
             break
     if summary_index is None:
-        lines.insert(0, assessment_line)
+        lines[0:0] = assessment_block + [""]
     else:
         insert_at = summary_index + 1
-        lines[insert_at:insert_at] = ["", assessment_line]
+        lines[insert_at:insert_at] = [""] + assessment_block
     return "\n".join(lines)
 
 
@@ -1722,14 +1749,23 @@ def check_live_http(settings: dict, path: str) -> tuple[bool, str]:
     release_host = str(publish_cfg.get("live_release_host", "m11h"))
     base = str(publish_cfg.get("live_local_url", "http://127.0.0.1:20000")).rstrip("/")
     host = str(publish_cfg.get("live_host_header", "afd-im-netz.de"))
-    curl_cmd = "curl -sS -o /dev/null -w '%%{http_code}' -H %s -H %s %s" % (
-        shell_quote("Host: " + host),
-        shell_quote("X-Forwarded-Proto: https"),
-        shell_quote(base + path),
-    )
-    proc = run_cmd(["ssh", release_host, curl_cmd], timeout=60)
-    code = (proc.stdout or "").strip()
-    return code == "200", "host=%s http=%s stderr=%s" % (release_host, code or "", (proc.stderr or "")[:200])
+    last_msg = ""
+    for attempt in range(1, 7):
+        curl_cmd = "curl -sS -o /dev/null -w '%%{http_code}' -H %s -H %s %s" % (
+            shell_quote("Host: " + host),
+            shell_quote("X-Forwarded-Proto: https"),
+            shell_quote(base + path),
+        )
+        proc = run_cmd(["ssh", release_host, curl_cmd], timeout=60)
+        code = (proc.stdout or "").strip()
+        last_msg = "host=%s attempt=%s http=%s stderr=%s" % (release_host, attempt, code or "", (proc.stderr or "")[:200])
+        if code == "200":
+            return True, last_msg
+        if attempt in {2, 4}:
+            flush_cmd = "cd /home/chris/web/afd-im-netz.de && docker compose -f compose.yml -f compose.live.yml run --rm wpcli rewrite flush --hard >/dev/null 2>&1 || docker compose -f compose.yml -f compose.live.yml run --rm wpcli cache flush >/dev/null 2>&1 || true"
+            run_cmd(["ssh", release_host, flush_cmd], timeout=180)
+        time.sleep(min(20, attempt * 3))
+    return False, last_msg
 
 
 def git_status(path: str) -> str:
@@ -1804,7 +1840,7 @@ repo="/home/chris/web/staging.afd-im-netz.de"
 main_worktree="/home/chris/web/tmp/afd-main-promote"
 live="/home/chris/web/afd-im-netz.de"
 cd "$repo"
-git fetch --prune origin dev main >/dev/null 2>&1 || true
+git fetch --prune origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/heads/main:refs/remotes/origin/main' >/dev/null
 branch="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$branch" != "dev" ]; then echo "staging repo not on dev: $branch" >&2; exit 21; fi
 dirty="$(git status --porcelain)"
@@ -1816,21 +1852,30 @@ fi
 git commit --allow-empty -m "$1" >/dev/null
 new_dev="$(git rev-parse HEAD)"
 git push origin dev >/dev/null
-ssh m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then echo 'm00h staging runtime dirty:' >&2; printf '%s\n' \"\$dirty\" >&2; exit 27; fi; git fetch --prune origin dev >/dev/null; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
+# This release script itself is streamed to bash via stdin over ssh. The nested
+# SSH call to m00h must therefore not read from stdin, otherwise it can consume
+# the remaining script and silently skip the main merge/live deploy steps.
+ssh -n m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then echo 'm00h staging runtime dirty:' >&2; printf '%s\n' \"\$dirty\" >&2; exit 27; fi; git fetch --prune origin dev >/dev/null; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
 if [ ! -e "$main_worktree/.git" ]; then echo "main worktree missing: $main_worktree" >&2; exit 24; fi
 cd "$main_worktree"
-git fetch --prune origin dev main >/dev/null
+git fetch --prune origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/heads/main:refs/remotes/origin/main' >/dev/null
 main_branch="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$main_branch" != "main" ]; then echo "main worktree not on main: $main_branch" >&2; exit 25; fi
 main_dirty="$(git status --porcelain)"
 if [ -n "$main_dirty" ]; then echo "main worktree dirty on m11h:" >&2; printf '%s\n' "$main_dirty" >&2; exit 26; fi
 git reset --hard origin/main >/dev/null
 git merge --no-ff origin/dev -m "Merge dev Faktencheck release into main" >/dev/null
+if ! git merge-base --is-ancestor "$new_dev" HEAD; then echo "main merge did not contain new dev commit $new_dev" >&2; exit 29; fi
 new_main="$(git rev-parse HEAD)"
 git push origin main >/dev/null
+git fetch --prune origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null
+origin_main="$(git rev-parse origin/main)"
+if [ "$origin_main" != "$new_main" ]; then echo "origin/main verification failed: $origin_main != $new_main" >&2; exit 30; fi
 cd "$live"
 git fetch --prune origin main >/dev/null
 AFD_DEPLOY_LOCK_WAIT=1800 ./scripts/deploy-live.sh
+live_head="$(git rev-parse HEAD)"
+if [ "$live_head" != "$new_main" ]; then echo "live checkout verification failed: $live_head != $new_main" >&2; exit 31; fi
 printf 'dev=%s main=%s\n' "$new_dev" "$new_main"
 '''
     release_host = str(publish_cfg.get("live_release_host", "m11h"))

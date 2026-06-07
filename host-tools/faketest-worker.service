@@ -10,11 +10,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/srv/tailshare/Faketest-Mails /home/chris/web/staging.afd-im-netz.de /home/chris/.ssh
-ReadOnlyPaths=/etc/faketest /home/chris/.config/opencode
+ReadWritePaths=/srv/tailshare/Faketest-Mails /home/chris/web/staging.afd-im-netz.de /home/chris/.ssh -/home/chris/.cache/huggingface -/home/chris/.cache/ctranslate2
+ReadOnlyPaths=/etc/faketest /home/chris/.config/opencode /opt/faketest-transcribe
 RestrictSUIDSGID=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+MemoryDenyWriteExecute=false
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 PrivateDevices=true
@@ -27,7 +27,10 @@ ProtectKernelTunables=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @raw-io @reboot @mount @swap @obsolete @debug @module @cpu-emulation @clock
+# faster-whisper/ctranslate2 uses native CPU acceleration and runtime libraries
+# that may require syscalls outside systemd's conservative @system-service set.
+# Keep the other filesystem/user/device protections, but do not apply a seccomp
+# SystemCallFilter here; otherwise the transcription subprocess can die with
+# SIGSYS (return code -31) while processing videos.
 UMask=0077
 ExecStart=/usr/local/sbin/faketest-worker.py
