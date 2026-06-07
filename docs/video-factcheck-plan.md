@@ -85,7 +85,12 @@ scripts/install-faster-whisper.sh --prefix /opt/faketest-transcribe --model smal
 
 ## Phase 2 candidates
 
-- `yt-dlp` support for public platform/news pages that are not direct media files.
 - Frame extraction and OCR of text overlays.
 - Time-coded transcript chunks and claim-level timestamps.
 - Better public-source attribution for embedded video pages.
+
+## Public video pages via yt-dlp
+
+The worker can optionally download public video pages via `yt-dlp` when `video.yt_dlp_enabled` is true and the host matches `video.yt_dlp_allowed_hosts`.
+
+Keep the allow-list narrow. This is intended for publicly available videos from known news/campaign sources, not for paywalled, logged-in or DRM-protected content.

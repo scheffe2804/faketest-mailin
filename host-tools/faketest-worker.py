@@ -512,6 +512,57 @@ def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict) -> d
     return item
 
 
+def is_video_page_candidate(url: str, settings: dict) -> bool:
+    cfg = settings.get("video", {})
+    if not bool(cfg.get("yt_dlp_enabled", False)):
+        return False
+    parsed = urllib.parse.urlparse(url or "")
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    host = parsed.netloc.lower().split(":", 1)[0]
+    allowed_hosts = [str(x).lower() for x in cfg.get("yt_dlp_allowed_hosts", [])]
+    if not allowed_hosts:
+        return False
+    return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts)
+
+
+def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dict:
+    cfg = settings.get("video", {})
+    video_dir = job_dir / "research" / "video-pages"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    target_template = video_dir / ("page-video-%02d.%%(ext)s" % index)
+    max_bytes = int(cfg.get("max_download_bytes", settings.get("limits", {}).get("attachment_bytes", 15728640)) or 15728640)
+    timeout = int(cfg.get("download_timeout_seconds", 180) or 180)
+    ytdlp = str(cfg.get("yt_dlp_command") or "yt-dlp")
+    command = [
+        ytdlp,
+        "--no-playlist",
+        "--max-filesize", str(max_bytes),
+        "--socket-timeout", str(max(10, min(timeout, 120))),
+        "--format", str(cfg.get("yt_dlp_format") or "bv*+ba/best"),
+        "--merge-output-format", "mp4",
+        "--output", str(target_template),
+        url,
+    ]
+    item = {"url": url, "ok": False, "title": "", "text": "", "error": "", "kind": "video-page"}
+    proc = run_cmd(command, timeout=timeout + 120)
+    if proc.returncode != 0:
+        item["error"] = "yt-dlp Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:400])
+        return item
+    candidates = sorted([p for p in video_dir.glob("page-video-%02d.*" % index) if p.is_file() and p.stat().st_size > 0], key=lambda p: p.stat().st_size, reverse=True)
+    if not candidates:
+        item["error"] = "yt-dlp lieferte keine Videodatei"
+        return item
+    video_path = candidates[0]
+    text, err = extract_video(job_dir, video_path, settings)
+    if err:
+        item["error"] = err
+    if text:
+        item.update({"ok": True, "title": "Video-Seite", "text": "Öffentlich verlinkte Video-Seite: %s\nLokale Analyse-Datei: %s\n\n%s" % (url, video_path.name, text)})
+        (video_dir / ("page-video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
+    return item
+
+
 def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[dict]:
     out: list[dict] = []
     direct_dir = job_dir / "research" / "direct-links"
@@ -522,6 +573,9 @@ def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[d
         item = {"url": url, "ok": False, "title": "", "text": "", "error": ""}
         if is_likely_video_url(url):
             out.append(fetch_direct_video(job_dir, url, index, settings))
+            continue
+        if is_video_page_candidate(url, settings):
+            out.append(fetch_video_page(job_dir, url, index, settings))
             continue
         if is_likely_binary_url(url):
             item["error"] = "binary/asset URL skipped"

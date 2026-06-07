@@ -75,7 +75,7 @@ sudo chown "$(id -u):$(id -g)" "$PREFIX"
 
 "$PYTHON" -m venv "$PREFIX/venv"
 "$PREFIX/venv/bin/python" -m pip install --upgrade pip wheel setuptools
-"$PREFIX/venv/bin/python" -m pip install faster-whisper
+"$PREFIX/venv/bin/python" -m pip install faster-whisper yt-dlp
 
 "$PREFIX/venv/bin/python" - <<PY
 from faster_whisper import WhisperModel
@@ -89,4 +89,7 @@ faster-whisper installed.
 
 Recommended settings command:
   $PREFIX/venv/bin/python /usr/local/sbin/faketest-transcribe.py --language de --model $MODEL --timeout 900 {audio}
+
+yt-dlp installed at:
+  $PREFIX/venv/bin/yt-dlp
 EOF
