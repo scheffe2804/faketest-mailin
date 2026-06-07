@@ -16,6 +16,21 @@ Common stages:
 - content generation failed → set job status to `freigegeben` after fixing the cause.
 - publication failed → set `publish_request.json.status` and `meta.publish_status` to `retry`.
 
+Preferred helper for publication retries:
+
+```bash
+scripts/retry-publish.py <job-id> --reason "short reason"
+ssh m00h 'sudo systemctl start faketest-worker.service'
+```
+
+List current publication blockers:
+
+```bash
+scripts/check-jobs.py --mode publish
+```
+
+When run locally against production data, use SSH or run the script on the host that can read `/srv/tailshare/Faketest-Mails`.
+
 ## Publication blocked by dirty Staging
 
 Check m00h Staging runtime:

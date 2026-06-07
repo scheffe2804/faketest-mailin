@@ -55,6 +55,32 @@ scp host-tools/faketest-worker.py m00h:/tmp/faketest-worker.py
 ssh m00h 'sudo install -m 0755 /tmp/faketest-worker.py /usr/local/sbin/faketest-worker.py'
 ```
 
+Preferred operational deployment:
+
+```bash
+scripts/deploy-worker.sh
+```
+
+Deploy real runtime settings only when explicitly intended:
+
+```bash
+scripts/deploy-worker.sh --settings
+```
+
+## Operational helpers
+
+List current publish blockers while ignoring historical backup directories:
+
+```bash
+scripts/check-jobs.py --mode publish
+```
+
+Prepare one approved publication request for retry:
+
+```bash
+scripts/retry-publish.py <job-id> --reason "why this retry is safe"
+```
+
 ## Publication flow
 
 1. Incoming mail is archived and processed.
