@@ -765,6 +765,164 @@ def split_claim_bullets(claim_text: str) -> list[str]:
     return claims
 
 
+def read_direct_links_artifact(job_dir: Path) -> list[dict]:
+    path = job_dir / "research" / "direct_links.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def read_video_page_metadata(job_dir: Path) -> list[dict]:
+    video_dir = job_dir / "research" / "video-pages"
+    if not video_dir.exists():
+        return []
+    out: list[dict] = []
+    for path in sorted(video_dir.glob("page-video-*.info.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def direct_video_infos(job_dir: Path) -> list[dict]:
+    links = read_direct_links_artifact(job_dir)
+    metadata_items = read_video_page_metadata(job_dir)
+    out: list[dict] = []
+    video_index = 0
+    for item in links:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "")
+        url = str(item.get("url") or "").strip()
+        text = str(item.get("text") or "")
+        if kind not in {"video", "video-page"} and not is_video_page_candidate(url, {"video": {"yt_dlp_enabled": True, "yt_dlp_allowed_hosts": ["youtube.com", "youtu.be"]}}):
+            continue
+        metadata = metadata_items[video_index] if video_index < len(metadata_items) else {}
+        video_index += 1
+        channel = str(item.get("channel") or metadata.get("channel") or metadata.get("uploader") or metadata.get("uploader_id") or "").strip()
+        video_title = str(item.get("video_title") or metadata.get("title") or "").strip()
+        raw_title = str(item.get("title") or "").strip()
+        if (not video_title or raw_title == "Video-Seite") and raw_title and raw_title != "Video-Seite":
+            if " - " in raw_title:
+                maybe_channel, maybe_title = raw_title.split(" - ", 1)
+                channel = channel or maybe_channel.strip()
+                video_title = video_title or maybe_title.strip()
+            else:
+                video_title = video_title or raw_title
+        display_title = " - ".join(part for part in (channel, video_title) if part) or raw_title or "Video-Seite"
+        out.append({
+            "url": url,
+            "kind": kind or "video-page",
+            "title": raw_title,
+            "channel": channel,
+            "video_title": video_title,
+            "display_title": display_title,
+            "text": text,
+        })
+    return out
+
+
+def seconds_to_mmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    return "%02d:%02d" % (seconds // 60, seconds % 60)
+
+
+def video_timestamp_url(url: str, seconds: int) -> str:
+    if not url:
+        return ""
+    sep = "&" if "?" in url else "?"
+    return "%s%st=%ds" % (url, sep, max(0, int(seconds)))
+
+
+def extract_video_transcript_segments(job_dir: Path) -> list[dict]:
+    segments: list[dict] = []
+    for info in direct_video_infos(job_dir):
+        text = str(info.get("text") or "")
+        url = str(info.get("url") or "")
+        for match in re.finditer(r"\[(\d{2}):(\d{2})-(\d{2}):(\d{2})\]\s*([^\n]+)", text):
+            start = int(match.group(1)) * 60 + int(match.group(2))
+            end = int(match.group(3)) * 60 + int(match.group(4))
+            spoken = re.sub(r"\s+", " ", match.group(5)).strip()
+            if spoken:
+                segments.append({"start": start, "end": end, "text": spoken, "url": url})
+    return segments
+
+
+def normalize_claim_match_text(value: str) -> str:
+    value = html.unescape(value or "").lower()
+    replacements = {"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"}
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def claim_match_tokens(claim: str) -> list[str]:
+    normalized = normalize_claim_match_text(claim)
+    stop = {
+        "dass", "wird", "werden", "wurde", "habe", "habe", "hätten", "haetten", "sein", "seien",
+        "eine", "einer", "einen", "einem", "der", "die", "das", "dem", "den", "und", "oder", "mit",
+        "von", "zur", "zum", "fuer", "uber", "ueber", "auch", "bei", "als", "aus", "im", "in",
+        "es", "wird", "behauptet", "video", "angegeben", "gesagt", "persoenlich",
+    }
+    tokens: list[str] = []
+    for token in normalized.split():
+        if len(token) < 3 and not token.isdigit():
+            continue
+        if token in stop:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+    return tokens[:14]
+
+
+def find_video_timestamp_for_claim(claim: str, segments: list[dict]) -> dict | None:
+    tokens = claim_match_tokens(claim)
+    if not tokens or not segments:
+        return None
+    best: tuple[float, int, int, str, str] | None = None
+    for index in range(len(segments)):
+        for window in (1, 2, 3):
+            chunk = segments[index:index + window]
+            if not chunk:
+                continue
+            text = normalize_claim_match_text(" ".join(str(item.get("text") or "") for item in chunk))
+            matched = [token for token in tokens if token in text]
+            if not matched:
+                continue
+            ratio = len(matched) / max(1, len(tokens))
+            numeric_bonus = 0.15 if any(token.isdigit() and token in text for token in tokens) else 0.0
+            score = ratio + numeric_bonus - (0.03 * (window - 1))
+            start = int(chunk[0].get("start") or 0)
+            end = int(chunk[-1].get("end") or start)
+            url = str(chunk[0].get("url") or "")
+            joined = " / ".join(str(item.get("text") or "") for item in chunk)
+            candidate = (score, start, end, url, joined)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    if best is None:
+        return None
+    score, start, end, url, text = best
+    min_matches = 2 if len(tokens) <= 5 else 3
+    matched_count = sum(1 for token in tokens if token in normalize_claim_match_text(text))
+    if score < 0.34 or matched_count < min_matches:
+        return None
+    return {
+        "start": start,
+        "end": end,
+        "label": "%s–%s" % (seconds_to_mmss(start), seconds_to_mmss(end)),
+        "url": video_timestamp_url(url, start),
+        "text": text,
+    }
+
+
 def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dict], sources: list[dict]) -> list[dict]:
     eval_dir = job_dir / "research" / "claim-evaluations"
     eval_dir.mkdir(parents=True, exist_ok=True)
@@ -853,7 +1011,7 @@ Extrahierte Behauptungen:
     return text.strip()
 
 
-def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: list[dict], evaluations: list[dict], intent_analysis: str, sources: list[dict]) -> str:
+def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: list[dict], evaluations: list[dict], intent_analysis: str, sources: list[dict], job_dir: Path | None = None) -> str:
     lines: list[str] = []
     checked_at = str(meta.get("received_at") or "")[:10] or now_utc().date().isoformat()
     checked_claims = sum(1 for item in evaluations or [] if (item.get("evaluation") or "").strip())
@@ -898,11 +1056,23 @@ def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: lis
         "2. FAKTENCHECK NACH AUSSAGEN",
         "",
     ])
+    video_segments = extract_video_transcript_segments(job_dir) if job_dir is not None else []
+    video_infos = direct_video_infos(job_dir) if job_dir is not None else []
+    fallback_video_url = ""
+    for info in video_infos:
+        fallback_video_url = str(info.get("url") or "").strip()
+        if fallback_video_url:
+            break
     for i, item in enumerate(evaluations or [], 1):
         lines.append("Block %d:" % i)
         claims = [re.sub(r"\s+", " ", str(claim)).strip() for claim in (item.get("claims") or []) if str(claim).strip()]
         if claims:
             lines.append("Aussage: " + "; ".join(claims))
+            timestamp = find_video_timestamp_for_claim("; ".join(claims), video_segments)
+            if timestamp and timestamp.get("url"):
+                lines.append("Video-Stelle: %s %s" % (timestamp.get("label"), timestamp.get("url")))
+            elif fallback_video_url:
+                lines.append("Video-Stelle: kein eindeutiger Timecode im Transkript automatisch gefunden; Direktlink: " + fallback_video_url)
         lines.append("Stand der Prüfung: " + checked_at)
         lines.append(item.get("evaluation", "").strip() or "Keine Bewertung erzeugt.")
         lines.append("")
@@ -1333,6 +1503,13 @@ def first_ocr_sentence_title(job_dir: Path, meta: dict) -> str:
 
 def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None) -> str:
     if job_dir is not None:
+        video_infos = direct_video_infos(job_dir)
+        for info in video_infos:
+            channel = str(info.get("channel") or "").strip()
+            video_title = str(info.get("video_title") or "").strip()
+            if video_title:
+                source = (channel + " - " + video_title).strip(" -") if channel else video_title
+                return limit_factcheck_title("Faktencheck: " + source)
         direct_links_path = job_dir / "research" / "direct_links.json"
         if direct_links_path.exists():
             try:
@@ -1425,6 +1602,10 @@ PUBLIC_LABELS = (
     "Framing/Wirkung",
     "Absicht",
     "Kritischer Befund",
+    "Video-Metadaten",
+    "Kanal",
+    "Videotitel",
+    "Video-Stelle",
     "Aussage",
     "Stand der Prüfung",
     "Bewertung",
@@ -1644,8 +1825,27 @@ def build_origin_section(job_dir: Path, meta: dict) -> str:
 
     parts: list[str] = []
     body_text = sanitize_public_text(body_text)
+    video_infos = direct_video_infos(job_dir)
+    video_urls = {str(info.get("url") or "").strip() for info in video_infos if str(info.get("url") or "").strip()}
+    if video_infos:
+        video_lines: list[str] = []
+        for i, info in enumerate(video_infos, 1):
+            channel = str(info.get("channel") or "").strip()
+            video_title = str(info.get("video_title") or "").strip()
+            url = str(info.get("url") or "").strip()
+            if channel:
+                video_lines.append("Kanal: " + channel)
+            if video_title:
+                video_lines.append("Videotitel: " + video_title)
+            if url:
+                video_lines.append("Direktlink %d: %s" % (i, url))
+        if video_lines:
+            parts.append("Video-Metadaten:\n" + "\n".join(video_lines))
+
     if body_text:
-        parts.append(body_text)
+        body_urls = set(extract_urls(body_text))
+        if not (video_urls and body_urls and body_urls.issubset(video_urls) and re.sub(r"https?://\S+", "", body_text).strip() == ""):
+            parts.append(body_text)
 
     image_texts: list[str] = []
     other_attachment_texts: list[str] = []
@@ -2217,7 +2417,7 @@ def process_job(job_dir: Path, settings: dict) -> None:
         if direct_claims:
             evaluations = evaluate_claim_groups(job_dir, settings, direct_claims, sources)
             intent_analysis = analyze_message_intent(job_dir, settings, meta, combined, direct_claims)
-            result = compose_chunked_factcheck(meta, combined, direct_claims, evaluations, intent_analysis, sources)
+            result = compose_chunked_factcheck(meta, combined, direct_claims, evaluations, intent_analysis, sources, job_dir)
         else:
             result = call_bifrost(settings, make_prompt(meta, combined, sources, direct_links, direct_claims))
         if not result.strip():
