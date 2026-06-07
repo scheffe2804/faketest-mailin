@@ -29,7 +29,7 @@
     "download_timeout_seconds": 180,
     "ffmpeg_timeout_seconds": 300,
     "transcribe_timeout_seconds": 900,
-    "transcribe_command": "python3 /usr/local/sbin/faketest-transcribe.py --language de --model small --timeout 900 {audio}"
+    "transcribe_command": "/opt/faketest-transcribe/venv/bin/python /usr/local/sbin/faketest-transcribe.py --language de --model small --timeout 900 {audio}"
   },
   "retention_days": {
     "completed": 90,

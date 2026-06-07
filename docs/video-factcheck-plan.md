@@ -64,7 +64,7 @@ Recommended wrapper command:
 
 ```json
 "video": {
-  "transcribe_command": "python3 /usr/local/sbin/faketest-transcribe.py --language de --model small --timeout 900 {audio}"
+  "transcribe_command": "/opt/faketest-transcribe/venv/bin/python /usr/local/sbin/faketest-transcribe.py --language de --model small --timeout 900 {audio}"
 }
 ```
 
@@ -72,9 +72,16 @@ The wrapper tries a custom command first if configured via `FAKETEST_TRANSCRIBE_
 
 - `whisper`
 - `whisper-ctranslate2`
+- Python module `faster_whisper`
 - `whisper-cli` / `whisper.cpp` / `main`
 
 The exact backend still has to be installed on the runtime host. The wrapper writes transcript text to stdout and diagnostics to stderr.
+
+Install helper for a CPU-only faster-whisper venv:
+
+```bash
+scripts/install-faster-whisper.sh --prefix /opt/faketest-transcribe --model small
+```
 
 ## Phase 2 candidates
 

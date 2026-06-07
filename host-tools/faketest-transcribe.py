@@ -70,6 +70,43 @@ def try_whisper_ctranslate2(audio: Path, language: str, model: str, timeout: int
     return False, "", (err or out or "rc=%s" % rc).strip()
 
 
+def try_faster_whisper_python(audio: Path, language: str, model: str, timeout: int, workdir: Path) -> tuple[bool, str, str]:
+    # The faster-whisper Python API does not expose a simple subprocess-level
+    # timeout. This backend is therefore tried after fast CLI backends and relies
+    # on the caller/systemd timeout for hard cancellation.
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except Exception as exc:
+        return False, "", "faster_whisper Python module not available: %s" % exc.__class__.__name__
+    try:
+        compute_type = os.environ.get("FAKETEST_TRANSCRIBE_COMPUTE_TYPE", "int8")
+        device = os.environ.get("FAKETEST_TRANSCRIBE_DEVICE", "cpu")
+        cpu_threads = int(os.environ.get("FAKETEST_TRANSCRIBE_CPU_THREADS", "2") or "2")
+        whisper = WhisperModel(model, device=device, compute_type=compute_type, cpu_threads=cpu_threads)
+        segments, info = whisper.transcribe(str(audio), language=language, beam_size=1, vad_filter=True)
+        lines: list[str] = []
+        for segment in segments:
+            text = (getattr(segment, "text", "") or "").strip()
+            if text:
+                lines.append("[%s-%s] %s" % (format_ts(float(segment.start)), format_ts(float(segment.end)), text))
+        transcript = "\n".join(lines).strip()
+        if transcript:
+            return True, transcript, ""
+        return False, "", "faster_whisper produced no transcript"
+    except Exception as exc:
+        return False, "", "faster_whisper failed: %s: %s" % (exc.__class__.__name__, str(exc)[:200])
+
+
+def format_ts(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h:
+        return "%d:%02d:%02d" % (h, m, s)
+    return "%02d:%02d" % (m, s)
+
+
 def try_whisper_cpp(audio: Path, language: str, model: str, timeout: int, workdir: Path) -> tuple[bool, str, str]:
     exe = shutil.which("whisper-cli") or shutil.which("whisper.cpp") or shutil.which("main")
     if not exe:
@@ -113,6 +150,7 @@ def main() -> int:
     for label, fn in [
         ("whisper", try_openai_whisper),
         ("whisper-ctranslate2", try_whisper_ctranslate2),
+        ("faster-whisper-python", try_faster_whisper_python),
         ("whisper.cpp", try_whisper_cpp),
     ]:
         ok, text, err = fn(audio, args.language, args.model, args.timeout, workdir)

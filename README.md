@@ -95,6 +95,12 @@ The worker has a first controlled video-processing path for video attachments an
 
 Platform/page downloads via `yt-dlp`, frame OCR and timestamped claim extraction are planned follow-up work.
 
+Install helper for a CPU-only `faster-whisper` runtime:
+
+```bash
+scripts/install-faster-whisper.sh --prefix /opt/faketest-transcribe --model small
+```
+
 ## Video fact-checking plan
 
 Video support is planned as an extension. See `docs/video-factcheck-plan.md`.
