@@ -1239,6 +1239,25 @@ def strip_publish_subject(subject: str) -> str:
     return subject
 
 
+FACTCHECK_TITLE_MAX_CHARS = 100
+
+
+def limit_factcheck_title(title: str, limit: int = FACTCHECK_TITLE_MAX_CHARS) -> str:
+    title = re.sub(r"\s+", " ", title or "").strip()
+    if len(title) <= limit:
+        return title
+    slice_ = title[: max(1, limit - 1)].rstrip()
+    cut = -1
+    for needle in (". ", "! ", "? ", ", ", "; ", ": ", " – ", " - ", " "):
+        pos = slice_.rfind(needle)
+        if pos > cut:
+            cut = pos
+    if cut >= max(20, int(limit * 0.6)):
+        slice_ = slice_[:cut]
+    slice_ = slice_.rstrip(" \t\n\r\0\x0B,;:.-–—")
+    return (slice_ or title[: max(1, limit - 1)].rstrip()) + "…"
+
+
 def is_image_ocr_job(meta: dict) -> bool:
     image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
     return any(str(item.get("extension") or Path(str(item.get("saved_name") or "")).suffix).lower() in image_suffixes for item in meta.get("attachments", []))
@@ -1270,10 +1289,10 @@ def first_ocr_sentence_title(job_dir: Path, meta: dict) -> str:
         return ""
     match = re.search(r"([A-ZÄÖÜ0-9][^.!?]{18,180}[.!?])(?:\s|$)", text)
     if match:
-        return match.group(1).strip(" .,:;–—-„“\"'")[:120]
+        return limit_factcheck_title(match.group(1).strip(" .,:;–—-„“\"'"))
     for line in lines:
         if 20 <= len(line) <= 140:
-            return line.strip(" .,:;–—-„“\"'")[:120]
+            return limit_factcheck_title(line.strip(" .,:;–—-„“\"'"))
     return ""
 
 
@@ -1281,10 +1300,10 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
     if job_dir is not None:
         ocr_title = first_ocr_sentence_title(job_dir, meta)
         if ocr_title:
-            return ocr_title
+            return limit_factcheck_title(ocr_title)
     subject = strip_publish_subject(meta.get("subject") or "")
     if subject and not re.match(r"^[A-Za-z]{1,4}$", subject):
-        return subject[:120]
+        return limit_factcheck_title(subject)
     generic_headings = {
         "erkannter inhalt", "1. erkannter inhalt", "faketest-ergebnis", "kurzfazit",
         "faktencheck", "faktencheck nach aussagen", "quellenlage", "wahrscheinlich gemeinter wortlaut:",
@@ -1301,7 +1320,7 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
         if match:
             candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;–—-„“\"'")
             if 25 <= len(candidate) <= 140:
-                return ("Faktencheck: " + candidate[:105].rstrip(" .,:;–—-"))[:120]
+                return limit_factcheck_title("Faktencheck: " + candidate.rstrip(" .,:;–—-"))
     for line in result.splitlines():
         clean = line.strip(" #-–—\t")
         if not clean:
@@ -1314,9 +1333,9 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
             continue
         if clean.startswith(("„", "\"", "'")) and 25 <= len(clean) <= 140:
             candidate = clean.strip(" .,:;–—-„“\"'")
-            return ("Faktencheck: " + candidate[:105].rstrip(" .,:;–—-"))[:120]
+            return limit_factcheck_title("Faktencheck: " + candidate.rstrip(" .,:;–—-"))
         if 12 <= len(clean) <= 120:
-            return clean
+            return limit_factcheck_title(clean)
     return "Faktencheck: Behauptung geprüft"
 
 
@@ -1782,7 +1801,7 @@ def create_or_update_factcheck_page(job_dir: Path, settings: dict, meta: dict) -
     publish_cfg = settings.get("publish", {})
     parent_id = ensure_faktencheck_parent(settings)
     result = (job_dir / "result" / "factcheck.md").read_text(encoding="utf-8", errors="replace")
-    title = derive_factcheck_title(meta, result, job_dir)
+    title = limit_factcheck_title(derive_factcheck_title(meta, result, job_dir))
     slug_base = slugify(title, "faktencheck-" + meta["job_id"][:8])
     slug = slug_base
     html_content = build_page_html(job_dir, meta, title)
