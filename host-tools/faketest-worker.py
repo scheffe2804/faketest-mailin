@@ -1673,6 +1673,19 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
         ocr_title = first_ocr_sentence_title(job_dir, meta)
         if ocr_title:
             return limit_factcheck_title(ocr_title)
+    if job_dir is not None:
+        body_path = job_dir / "body.txt"
+        if body_path.exists():
+            body_raw = body_path.read_text(encoding="utf-8", errors="replace").strip()
+            body_line = re.sub(r"\s+", " ", body_raw).strip()
+            if body_line:
+                sentence_match = re.match(r”^(.+?[.!?])(?:\s|$)”, body_line)
+                if sentence_match:
+                    candidate = sentence_match.group(1).strip(“ .,:;–—-„””\”'”)
+                    if len(candidate) >= 20:
+                        return limit_factcheck_title(candidate)
+                elif len(body_line) >= 20:
+                    return limit_factcheck_title(body_line)
     subject = strip_publish_subject(meta.get("subject") or "")
     if subject and not re.match(r"^[A-Za-z]{1,4}$", subject):
         return limit_factcheck_title(subject)
