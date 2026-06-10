@@ -1679,9 +1679,9 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
             body_raw = body_path.read_text(encoding="utf-8", errors="replace").strip()
             body_line = re.sub(r"\s+", " ", body_raw).strip()
             if body_line:
-                sentence_match = re.match(r”^(.+?[.!?])(?:\s|$)”, body_line)
+                sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", body_line)
                 if sentence_match:
-                    candidate = sentence_match.group(1).strip(“ .,:;–—-„””\”'”)
+                    candidate = sentence_match.group(1).strip(" .,:;–—-„“\"'")
                     if len(candidate) >= 20:
                         return limit_factcheck_title(candidate)
                 elif len(body_line) >= 20:
