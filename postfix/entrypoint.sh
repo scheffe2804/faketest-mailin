@@ -5,6 +5,7 @@ config_dir="/config"
 router_script="/opt/mail-router/mail_router.py"
 ki_router_script="/opt/mail-router/ki_mail_router.py"
 factcheck_router_script="/opt/mail-router/factcheck_router.py"
+facebook_approval_router_script="/opt/mail-router/facebook_approval_router.py"
 
 required_files=(virtual vmailbox transport relay_recipients recipient_access ki_sender_access factcheck_sender_access)
 for file in "${required_files[@]}"; do
@@ -81,6 +82,13 @@ if ! grep -q '^factcheckrouter ' /etc/postfix/master.cf; then
   cat >> /etc/postfix/master.cf <<EOF
 factcheckrouter unix -       n       n       -       -       pipe
   flags=Rq user=router argv=${factcheck_router_script} --recipient \${recipient} --original-recipient \${original_recipient} --sender \${sender}
+EOF
+fi
+
+if ! grep -q '^facebookapprovalrouter ' /etc/postfix/master.cf; then
+  cat >> /etc/postfix/master.cf <<EOF
+facebookapprovalrouter unix -       n       n       -       -       pipe
+  flags=Rq user=router argv=${facebook_approval_router_script} --recipient \${recipient} --original-recipient \${original_recipient} --sender \${sender}
 EOF
 fi
 
