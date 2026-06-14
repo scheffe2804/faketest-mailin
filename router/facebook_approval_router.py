@@ -17,7 +17,7 @@ from pathlib import Path
 ARCHIVE_DIR = Path("/srv/mailin/archive/facebook-approval")
 STATE_DIR = Path("/srv/mailin/archive/facebook-approval-state")
 JOB_DIR = Path("/srv/mailin/archive/facebook-approval-jobs/pending")
-TOKEN_RE = re.compile(r"^\s*APPROVE-FACEBOOK-POST\s*:\s*([A-Za-z0-9]{20,80})\s*$", re.IGNORECASE | re.MULTILINE)
+TOKEN_RE = re.compile(r"APPROVE-FACEBOOK-POST\s*:\s*([A-Za-z0-9]{20,80})", re.IGNORECASE)
 
 
 def unique_prefix() -> str:
