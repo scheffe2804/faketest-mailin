@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import base64
 import json
 import os
 import re
@@ -2291,19 +2292,20 @@ def git_status(path: str) -> str:
     proc = run_cmd(["git", "-C", path, "status", "--porcelain"], timeout=60)
     if proc.returncode != 0:
         return "__ERROR__\n" + (proc.stderr or proc.stdout)
-    return proc.stdout.strip()
+    return proc.stdout.rstrip("\n")
 
 
 def classify_update_changes(status: str) -> tuple[bool, list[str], list[str]]:
     allowed: list[str] = []
     blockers: list[str] = []
     for line in status.splitlines():
-        item = line.strip()
-        if not item:
+        raw_item = line.rstrip()
+        if not raw_item.strip():
             continue
-        path = item[3:] if len(item) > 3 else item
+        item = raw_item.strip()
+        path = raw_item[3:].strip() if len(raw_item) > 3 else item
         if path.startswith("wp-content/plugins/") or path.startswith("wp-content/themes/") or path.startswith("wp-content/upgrade/"):
-            allowed.append(item)
+            allowed.append(path)
         elif path in {".maintenance"} or path.endswith("/.maintenance"):
             blockers.append(item)
         elif ".env" in path.lower() or "secret" in path.lower() or "credential" in path.lower():
@@ -2341,7 +2343,7 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
         ok_updates, allowed_updates, blockers = classify_update_changes(status)
         if not ok_updates:
             return False, "Staging-Git nicht sauber; Blocker: " + "; ".join(blockers[:20]), ""
-        if allowed_updates:
+        if allowed_updates and not bool(publish_cfg.get("release_allow_update_changes", False)):
             return False, "Staging-Runtime enthält erkennbare abgeschlossene WordPress-/Theme-/Plugin-Update-Änderungen. Sie werden nicht als inhaltlicher Fehler gewertet, können aber wegen des bestehenden Promote-Flows nicht automatisch live gehen, solange m00h-Staging nicht Git-clean ist. Bitte diese Update-Änderungen bewusst in die m11h-Git-Quelle übernehmen oder auf m00h bereinigen. Befund: " + "; ".join(allowed_updates[:30]), ""
     wp_ok, wp_notes = wp_update_health(settings)
     if not wp_ok:
@@ -2349,12 +2351,17 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
     # Release from m00h is intentionally delegated to m11h to respect the project topology.
     # The script only performs the safe, standard git release if both trees allow it.
     message = str(publish_cfg.get("release_empty_commit_message", "release Faktencheck: {title}")).replace("{title}", title[:80])
+    message_b64 = base64.b64encode(message.encode("utf-8")).decode("ascii")
+    allowed_update_paths = "\n".join(path.strip() for path in allowed_updates)
+    allowed_update_paths_b64 = base64.b64encode(allowed_update_paths.encode("utf-8")).decode("ascii")
     release_script = r'''
 set -euo pipefail
 export GIT_AUTHOR_NAME="Faketest Publisher"
 export GIT_AUTHOR_EMAIL="faketest@m00h.eu"
 export GIT_COMMITTER_NAME="Faketest Publisher"
 export GIT_COMMITTER_EMAIL="faketest@m00h.eu"
+release_message="$(printf '%s' "$1" | base64 -d)"
+allowed_update_paths_b64="${2-}"
 repo="/home/chris/web/staging.afd-im-netz.de"
 main_worktree="/home/chris/web/tmp/afd-main-promote"
 live="/home/chris/web/afd-im-netz.de"
@@ -2364,11 +2371,31 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 if [ "$branch" != "dev" ]; then echo "staging repo not on dev: $branch" >&2; exit 21; fi
 dirty="$(git status --porcelain)"
 if [ -n "$dirty" ]; then echo "staging repo dirty on m11h:" >&2; printf '%s\n' "$dirty" >&2; exit 22; fi
+if [ -n "$allowed_update_paths_b64" ]; then
+  paths_file="$(mktemp)"
+  printf '%s' "$allowed_update_paths_b64" | base64 -d | sed '/^$/d' > "$paths_file"
+  remote_tar_cmd="$(python3 - "$paths_file" <<'PY'
+import shlex, sys
+from pathlib import Path
+paths = [line.strip() for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+print("cd /home/chris/web/staging.afd-im-netz.de && tar -cf - -- " + " ".join(shlex.quote(path) for path in paths))
+PY
+)"
+  ssh m00h "$remote_tar_cmd" | tar -xf -
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    git add -- "$path"
+  done < "$paths_file"
+  if ! git diff --cached --quiet; then
+    git commit -m "chore: absorb staging WordPress updates" >/dev/null
+  fi
+  rm -f "$paths_file"
+fi
 if [ -d "$live/.git" ]; then
   live_dirty="$(git -C "$live" status --porcelain)"
   if [ -n "$live_dirty" ]; then echo "live repo dirty on m11h:" >&2; printf '%s\n' "$live_dirty" >&2; exit 23; fi
 fi
-git commit --allow-empty -m "$1" >/dev/null
+git commit --allow-empty -m "$release_message" >/dev/null
 new_dev="$(git rev-parse HEAD)"
 git push origin dev >/dev/null
 # This release script itself is streamed to bash via stdin over ssh. The nested
@@ -2398,7 +2425,7 @@ if [ "$live_head" != "$new_main" ]; then echo "live checkout verification failed
 printf 'dev=%s main=%s\n' "$new_dev" "$new_main"
 '''
     release_host = str(publish_cfg.get("live_release_host", "m11h"))
-    proc = subprocess.run(["ssh", release_host, "bash", "-s", "--", message], input=release_script, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2400, check=False)
+    proc = subprocess.run(["ssh", release_host, "bash", "-s", "--", message_b64, allowed_update_paths_b64], input=release_script, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2400, check=False)
     log_publish(job_dir, "release stdout=%s stderr=%s" % ((proc.stdout or "")[-1200:], (proc.stderr or "")[-1200:]))
     if proc.returncode != 0:
         return False, "Release/Deploy fehlgeschlagen rc=%s stderr=%s" % (proc.returncode, (proc.stderr or proc.stdout)[-1200:]), ""
