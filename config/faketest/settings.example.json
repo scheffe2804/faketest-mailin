@@ -84,7 +84,7 @@
   },
   "search_url": "https://search.example.org/search",
   "bifrost": {
-    "model": "openai/gpt-5.5",
+    "model": "cx/gpt-5.5",
     "opencode_config": "/home/example/.config/opencode/opencode.json"
   }
 }
