@@ -85,6 +85,7 @@
   "search_url": "https://search.example.org/search",
   "bifrost": {
     "model": "cx/gpt-5.5",
+    "base_url": "https://ai.schroejahr.de/v1",
     "opencode_config": "/home/example/.config/opencode/opencode.json"
   }
 }

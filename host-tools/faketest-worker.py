@@ -486,12 +486,13 @@ def send_approval_request(settings: dict, job_dir: Path, meta: dict, risks: list
 
 
 def load_bifrost_config(settings: dict) -> tuple[str, str]:
+    settings_bifrost = settings.get("bifrost", {})
     p = Path(settings["bifrost"].get("opencode_config", "/home/chris/.config/opencode/opencode.json"))
     cfg = json.loads(p.read_text(encoding="utf-8"))
     provider = cfg.get("provider", {}).get("bifrost", {})
     opts = provider.get("options", {})
     key = opts.get("apiKey") or opts.get("api_key") or provider.get("apiKey") or provider.get("key")
-    base = opts.get("baseURL") or opts.get("base_url") or provider.get("api") or "https://ai.schroejahr.de/openai/v1"
+    base = settings_bifrost.get("baseURL") or settings_bifrost.get("base_url") or opts.get("baseURL") or opts.get("base_url") or provider.get("api") or "https://ai.schroejahr.de/v1"
     if not key:
         raise RuntimeError("Bifrost API-Key nicht gefunden")
     return base.rstrip("/"), key
