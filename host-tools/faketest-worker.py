@@ -1607,36 +1607,74 @@ def is_image_ocr_job(meta: dict) -> bool:
     return any(str(item.get("extension") or Path(str(item.get("saved_name") or "")).suffix).lower() in image_suffixes for item in meta.get("attachments", []))
 
 
+def ensure_factcheck_prefix(title: str) -> str:
+    title = re.sub(r"\s+", " ", title or "").strip(" .,:;–—-„“\"'")
+    if not title:
+        return "Faktencheck: Behauptung aus dem Netz"
+    if title.lower().startswith("faktencheck:"):
+        return title
+    return "Faktencheck: " + title
+
+def normalize_title_lines(lines: list[str]) -> str:
+    out = ""
+    for raw in lines:
+        line = re.sub(r"\s+", " ", raw or "").strip(" #\t& •·|–— ")
+        if not line:
+            continue
+        if out.endswith("-") and re.match(r"^[A-Za-zÄÖÜäöüß]", line):
+            out = out[:-1] + line
+        else:
+            out = (out + " " + line).strip()
+    return re.sub(r"\s+", " ", out).strip(" .,:;–—-„“\"'")
+
+
+def is_suspicious_factcheck_title(title: str) -> bool:
+    clean = re.sub(r"\s+", " ", title or "").strip()
+    if not clean:
+        return True
+    text = re.sub(r"(?i)^faktencheck:\s*", "", clean)
+    words = re.findall(r"[A-Za-zÄÖÜäöüß]{3,}", text)
+    if len(words) < 4:
+        return True
+    weird_chars = len(re.findall(r"[|\\<>%#_=~^{}\[\]`´]+", text))
+    if weird_chars >= 2:
+        return True
+    tokens = re.findall(r"\S+", text)
+    short_noise = sum(1 for token in tokens if re.search(r"[A-Za-zÄÖÜäöüß]", token) and len(re.sub(r"[^A-Za-zÄÖÜäöüß]", "", token)) <= 2)
+    if tokens and short_noise / max(1, len(tokens)) > 0.25:
+        return True
+    damaged_words = sum(1 for word in words if re.search(r"[bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ]{5,}", word))
+    return damaged_words >= 2
+
 def first_ocr_sentence_title(job_dir: Path, meta: dict) -> str:
     if not is_image_ocr_job(meta):
         return ""
     combined_path = job_dir / "extracted" / "combined.txt"
     if not combined_path.exists():
         return ""
-    lines: list[str] = []
+    blocks: list[list[str]] = []
+    current: list[str] = []
     for raw in combined_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = re.sub(r"\s+", " ", raw).strip(" #\t")
-        if not line or line.lower().startswith("anhang "):
+        line = raw.strip()
+        if line.startswith("## Anhang") or line.lower().startswith("anhang "):
+            if current:
+                blocks.append(current)
+                current = []
             continue
-        if line.startswith("## Anhang"):
+        if not line:
+            if current:
+                blocks.append(current)
+                current = []
             continue
-        # Social-media screenshots often start with account names/handles before
-        # the actual claim. Those are not good public titles; use the first real
-        # sentence from the OCR text instead.
         if "@" in line and not re.search(r"[.!?]", line):
             continue
-        line = line.strip("& •·|–—- ")
-        if line:
-            lines.append(line)
-    text = re.sub(r"\s+", " ", " ".join(lines)).strip()
-    if not text:
-        return ""
-    match = re.search(r"([A-ZÄÖÜ0-9][^.!?]{18,180}[.!?])(?:\s|$)", text)
-    if match:
-        return limit_factcheck_title(match.group(1).strip(" .,:;–—-„“\"'"))
-    for line in lines:
-        if 20 <= len(line) <= 140:
-            return limit_factcheck_title(line.strip(" .,:;–—-„“\"'"))
+        current.append(line)
+    if current:
+        blocks.append(current)
+    for block in blocks:
+        candidate = normalize_title_lines(block)
+        if len(candidate) >= 20 and not is_suspicious_factcheck_title(candidate):
+            return limit_factcheck_title(ensure_factcheck_prefix(candidate))
     return ""
 
 
@@ -1690,7 +1728,7 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
                     return limit_factcheck_title(body_line)
     subject = strip_publish_subject(meta.get("subject") or "")
     if subject and not re.match(r"^[A-Za-z]{1,4}$", subject):
-        return limit_factcheck_title(subject)
+        return limit_factcheck_title(ensure_factcheck_prefix(subject))
     generic_headings = {
         "erkannter inhalt", "1. erkannter inhalt", "faketest-ergebnis", "kurzfazit",
         "faktencheck", "faktencheck nach aussagen", "quellenlage", "wahrscheinlich gemeinter wortlaut:",
@@ -1706,7 +1744,7 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
         match = re.search(pattern, result)
         if match:
             candidate = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;–—-„“\"'")
-            if 25 <= len(candidate) <= 140:
+            if 25 <= len(candidate) <= 140 and not is_suspicious_factcheck_title(candidate):
                 return limit_factcheck_title("Faktencheck: " + candidate.rstrip(" .,:;–—-"))
     for line in result.splitlines():
         clean = line.strip(" #-–—\t")
@@ -1720,9 +1758,10 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
             continue
         if clean.startswith(("„", "\"", "'")) and 25 <= len(clean) <= 140:
             candidate = clean.strip(" .,:;–—-„“\"'")
-            return limit_factcheck_title("Faktencheck: " + candidate.rstrip(" .,:;–—-"))
-        if 12 <= len(clean) <= 120:
-            return limit_factcheck_title(clean)
+            if not is_suspicious_factcheck_title(candidate):
+                return limit_factcheck_title("Faktencheck: " + candidate.rstrip(" .,:;–—-"))
+        if 12 <= len(clean) <= 120 and not is_suspicious_factcheck_title(clean):
+            return limit_factcheck_title(ensure_factcheck_prefix(clean))
     return "Faktencheck: Behauptung geprüft"
 
 
