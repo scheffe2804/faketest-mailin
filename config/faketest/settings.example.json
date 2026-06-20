@@ -68,6 +68,7 @@
     "menu_title": "Faktencheck",
     "release_enabled": true,
     "release_allow_update_changes": true,
+    "release_repo_url": "git@github.com:example/site.git",
     "release_empty_commit_message": "release Faktencheck: {title}"
   },
   "allowed_extensions": [".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".txt", ".mp4", ".mov", ".m4v", ".webm", ".mkv"],

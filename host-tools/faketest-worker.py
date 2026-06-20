@@ -2376,21 +2376,33 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
         return False, "Release-Automatik ist deaktiviert", ""
     staging_dir = str(publish_cfg.get("staging_dir", "/home/chris/web/staging.afd-im-netz.de"))
     live_dir = str(publish_cfg.get("live_dir", "/home/chris/web/afd-im-netz.de"))
-    status = git_status(staging_dir)
+    # The release path below intentionally does not use the normal m11h staging
+    # working tree as its mutable checkout. A dirty / wrong-branch / locally
+    # broken staging checkout must not block a mail-approved Faktencheck release.
+    # We still inspect m00h's staging runtime before resetting it so that known
+    # WordPress update leftovers can be copied into the isolated release checkout
+    # when explicitly allowed by configuration.
+    status = ""
+    staging_status_probe = run_cmd(["ssh", str(publish_cfg.get("staging_git_host", "m00h")), "cd %s && git status --porcelain" % shell_quote(staging_dir)], timeout=120)
+    if staging_status_probe.returncode == 0:
+        status = staging_status_probe.stdout.rstrip("\n")
     allowed_updates: list[str] = []
     if status:
         ok_updates, allowed_updates, blockers = classify_update_changes(status)
         if not ok_updates:
-            return False, "Staging-Git nicht sauber; Blocker: " + "; ".join(blockers[:20]), ""
+            log_publish(job_dir, "staging git dirty with non-update paths; release will back up and reset m00h staging before deploy: %s" % "; ".join(blockers[:20]))
         if allowed_updates and not bool(publish_cfg.get("release_allow_update_changes", False)):
             return False, "Staging-Runtime enthält erkennbare abgeschlossene WordPress-/Theme-/Plugin-Update-Änderungen. Sie werden nicht als inhaltlicher Fehler gewertet, können aber wegen des bestehenden Promote-Flows nicht automatisch live gehen, solange m00h-Staging nicht Git-clean ist. Bitte diese Update-Änderungen bewusst in die m11h-Git-Quelle übernehmen oder auf m00h bereinigen. Befund: " + "; ".join(allowed_updates[:30]), ""
     wp_ok, wp_notes = wp_update_health(settings)
     if not wp_ok:
         return False, "WordPress-/Plugin-Updatezustand unklar: " + "; ".join(wp_notes), ""
     # Release from m00h is intentionally delegated to m11h to respect the project topology.
-    # The script only performs the safe, standard git release if both trees allow it.
+    # The script performs git writes in throw-away clones so the regular staging
+    # checkout on m11h can be dirty, on another branch, or otherwise unavailable.
     message = str(publish_cfg.get("release_empty_commit_message", "release Faktencheck: {title}")).replace("{title}", title[:80])
     message_b64 = base64.b64encode(message.encode("utf-8")).decode("ascii")
+    repo_url = str(publish_cfg.get("release_repo_url", "git@github.com:scheffe2804/afd-im-netz.de.git"))
+    repo_url_b64 = base64.b64encode(repo_url.encode("utf-8")).decode("ascii")
     allowed_update_paths = "\n".join(path.strip() for path in allowed_updates)
     allowed_update_paths_b64 = base64.b64encode(allowed_update_paths.encode("utf-8")).decode("ascii")
     release_script = r'''
@@ -2400,16 +2412,23 @@ export GIT_AUTHOR_EMAIL="faketest@m00h.eu"
 export GIT_COMMITTER_NAME="Faketest Publisher"
 export GIT_COMMITTER_EMAIL="faketest@m00h.eu"
 release_message="$(printf '%s' "$1" | base64 -d)"
-allowed_update_paths_b64="${2-}"
+repo_url="$(printf '%s' "${2-}" | base64 -d)"
+allowed_update_paths_b64="${3-}"
 repo="/home/chris/web/staging.afd-im-netz.de"
-main_worktree="/home/chris/web/tmp/afd-main-promote"
+tmp_root="/home/chris/web/tmp/faketest-release"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+dev_worktree="$tmp_root/dev-$run_id"
+main_worktree="$tmp_root/main-$run_id"
 live="/home/chris/web/afd-im-netz.de"
-cd "$repo"
+mkdir -p "$tmp_root"
+cleanup() {
+  rm -rf "$dev_worktree" "$main_worktree"
+}
+trap cleanup EXIT
+git clone --origin origin "$repo_url" "$dev_worktree" >/dev/null
+cd "$dev_worktree"
 git fetch --prune origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/heads/main:refs/remotes/origin/main' >/dev/null
-branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$branch" != "dev" ]; then echo "staging repo not on dev: $branch" >&2; exit 21; fi
-dirty="$(git status --porcelain)"
-if [ -n "$dirty" ]; then echo "staging repo dirty on m11h:" >&2; printf '%s\n' "$dirty" >&2; exit 22; fi
+git checkout -B faketest-release-dev origin/dev >/dev/null
 if [ -n "$allowed_update_paths_b64" ]; then
   paths_file="$(mktemp)"
   printf '%s' "$allowed_update_paths_b64" | base64 -d | sed '/^$/d' > "$paths_file"
@@ -2436,19 +2455,15 @@ if [ -d "$live/.git" ]; then
 fi
 git commit --allow-empty -m "$release_message" >/dev/null
 new_dev="$(git rev-parse HEAD)"
-git push origin dev >/dev/null
+git push origin HEAD:dev >/dev/null
 # This release script itself is streamed to bash via stdin over ssh. The nested
 # SSH call to m00h must therefore not read from stdin, otherwise it can consume
 # the remaining script and silently skip the main merge/live deploy steps.
-ssh -n m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then echo 'm00h staging runtime dirty:' >&2; printf '%s\n' \"\$dirty\" >&2; exit 27; fi; git fetch --prune origin dev >/dev/null; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
-if [ ! -e "$main_worktree/.git" ]; then echo "main worktree missing: $main_worktree" >&2; exit 24; fi
+ssh -n m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then backup_dir=\"/home/chris/web/backups/faketest-staging-git/\$(date -u +%Y%m%dT%H%M%SZ)-$new_dev\"; mkdir -p \"\$backup_dir\"; git status --porcelain > \"\$backup_dir/status.txt\"; git status --porcelain | awk '{print substr(\$0,4)}' | sed '/^$/d' > \"\$backup_dir/paths.txt\"; tar -czf \"\$backup_dir/dirty-files.tar.gz\" --ignore-failed-read --files-from \"\$backup_dir/paths.txt\" 2>/dev/null || true; echo \"m00h staging runtime dirty; backed up to \$backup_dir and resetting to faketest release commit\" >&2; git reset --hard >/dev/null; git clean -fd >/dev/null; fi; git fetch --prune origin dev >/dev/null; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
+git clone --origin origin "$repo_url" "$main_worktree" >/dev/null
 cd "$main_worktree"
 git fetch --prune origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/heads/main:refs/remotes/origin/main' >/dev/null
-main_branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ "$main_branch" != "main" ]; then echo "main worktree not on main: $main_branch" >&2; exit 25; fi
-main_dirty="$(git status --porcelain)"
-if [ -n "$main_dirty" ]; then echo "main worktree dirty on m11h:" >&2; printf '%s\n' "$main_dirty" >&2; exit 26; fi
-git reset --hard origin/main >/dev/null
+git checkout -B faketest-release-main origin/main >/dev/null
 git merge --no-ff origin/dev -m "Merge dev Faktencheck release into main" >/dev/null
 if ! git merge-base --is-ancestor "$new_dev" HEAD; then echo "main merge did not contain new dev commit $new_dev" >&2; exit 29; fi
 new_main="$(git rev-parse HEAD)"
@@ -2464,7 +2479,7 @@ if [ "$live_head" != "$new_main" ]; then echo "live checkout verification failed
 printf 'dev=%s main=%s\n' "$new_dev" "$new_main"
 '''
     release_host = str(publish_cfg.get("live_release_host", "m11h"))
-    proc = subprocess.run(["ssh", release_host, "bash", "-s", "--", message_b64, allowed_update_paths_b64], input=release_script, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2400, check=False)
+    proc = subprocess.run(["ssh", release_host, "bash", "-s", "--", message_b64, repo_url_b64, allowed_update_paths_b64], input=release_script, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2400, check=False)
     log_publish(job_dir, "release stdout=%s stderr=%s" % ((proc.stdout or "")[-1200:], (proc.stderr or "")[-1200:]))
     if proc.returncode != 0:
         return False, "Release/Deploy fehlgeschlagen rc=%s stderr=%s" % (proc.returncode, (proc.stderr or proc.stdout)[-1200:]), ""
