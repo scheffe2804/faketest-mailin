@@ -2533,7 +2533,7 @@ git checkout -B faketest-release-main origin/main >/dev/null
 git merge --no-ff origin/dev -m "Merge dev Faktencheck release into main" >/dev/null
 if ! git merge-base --is-ancestor "$new_dev" HEAD; then echo "main merge did not contain new dev commit $new_dev" >&2; exit 29; fi
 new_main="$(git rev-parse HEAD)"
-git push origin main >/dev/null
+git push origin HEAD:main >/dev/null
 git fetch --prune origin '+refs/heads/main:refs/remotes/origin/main' >/dev/null
 origin_main="$(git rev-parse origin/main)"
 if [ "$origin_main" != "$new_main" ]; then echo "origin/main verification failed: $origin_main != $new_main" >&2; exit 30; fi
