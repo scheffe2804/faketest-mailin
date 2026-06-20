@@ -516,6 +516,55 @@ def search_web(settings: dict, query: str) -> list[dict]:
     return out
 
 
+def build_research_queries(settings: dict, meta: dict, combined_text: str, primary_query: str) -> list[str]:
+    """Build a broader query set for careful fact checks.
+
+    The first query stays the concise claim query. Additional variants push the
+    worker toward primary sources, fact-check/context pages, official data and
+    criticism/counter-evidence. This makes ordinary mail/image-only Faketests
+    less dependent on one search result page.
+    """
+    text = re.sub(r"\s+", " ", (combined_text or "")).strip()
+    subject = re.sub(r"\s+", " ", str(meta.get("subject") or "")).strip()
+    queries: list[str] = []
+
+    def add(query: str) -> None:
+        query = re.sub(r"\s+", " ", query or "").strip(" -;:,.\t")[:500]
+        if query and query not in queries:
+            queries.append(query)
+
+    add(primary_query)
+    if subject and subject.lower() not in {"fwd:", "fw:", "re:", "aw:"}:
+        add(subject + " Faktencheck Quellen")
+    add(primary_query + " Originalquelle Primärquelle")
+    add(primary_query + " Faktencheck Kontext")
+    add(primary_query + " offiziell Statistik Behörde")
+    add(primary_query + " Kritik Gegenargument Einordnung")
+
+    # Pull a second concrete sentence if the first query came from a short OCR or
+    # mail fragment. This often finds a different source cluster.
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+    for sentence in sentences:
+        sentence = re.sub(r"\s+", " ", sentence).strip(" -:\t")
+        if 30 <= len(sentence) <= 180 and sentence not in primary_query:
+            add(sentence + " Quelle")
+            break
+
+    limit = int(settings.get("limits", {}).get("search_queries_per_job", 8) or 8)
+    return queries[:max(1, limit)]
+
+
+def search_web_deep(settings: dict, queries: list[str]) -> tuple[list[dict], list[dict]]:
+    searches: list[dict] = []
+    groups: list[list[dict]] = []
+    for query in queries[: int(settings.get("limits", {}).get("search_queries_per_job", 8) or 8)]:
+        sources = search_web(settings, query) if query else []
+        searches.append({"query": query, "sources": sources})
+        groups.append(sources)
+    merged = merge_sources_unique(groups, limit=max(12, int(settings.get("limits", {}).get("sources_per_job", 12) or 12)))
+    return merged, searches
+
+
 def extract_urls(text: str) -> list[str]:
     urls: list[str] = []
     for match in re.findall(r"https?://[^\s<>\"')]+", text or "", flags=re.IGNORECASE):
@@ -1046,7 +1095,7 @@ Einordnung: <Kontext/Framing>
 Nachsuche: <welche gezielten Suchziele abgearbeitet wurden und was noch nicht belastbar ist>
 """ % (claim_text, evaluation, "\n".join(source_lines))
     try:
-        revised = call_bifrost(settings, prompt, max_tokens=520)
+        revised = call_bifrost(settings, prompt, max_tokens=700)
     except Exception as exc:
         searched = "; ".join(queries[:3])
         revised = (evaluation or "").strip() + "\nNachsuche: Gezielt gesucht nach: %s. Die automatische Auswertung der Nachsuche ist technisch fehlgeschlagen (%s); keine zusätzliche Negativbewertung aus fehlender Auswertung." % (searched, exc.__class__.__name__)
@@ -1090,18 +1139,21 @@ Wichtige Regeln:
 - Bewerte diese Aussage nur anhand der gezielten Quellen oben und des konkreten Aussagewortlauts.
 - Verwechsle niemals "in diesen Quellen nicht gefunden" mit "falsch" oder "unbelegt".
 - Wenn die gezielten Quellen thematisch nicht passen oder nicht aktuell genug sind, schreibe: "In diesem automatischen Lauf nicht ausreichend geprüft".
+- Pruefe bevorzugt Primaerquellen/Originaldaten/Originalzitate; nutze Sekundaerquellen als Kontext, aber kennzeichne sie.
+- Vergleiche mindestens stuetzende und widersprechende Hinweise, falls vorhanden. Erklaere, warum eine Quelle stark, schwach oder unpassend ist.
 - Bei aktuellen Lagebehauptungen (z. B. Krieg, Schifffahrt, Energie, Preise, Behörden-/Gerichtsentscheidungen) muss der Zeitpunkt/Stand der Prüfung ausdrücklich berücksichtigt werden.
 - Erfinde keine Timecodes oder Zeitabschnitte. Nutze Zeitangaben nur, wenn sie im Material/Transkript wirklich vorhanden sind.
+- Die Einordnung muss erklaeren, welche Wahrnehmung durch die Aussage gelenkt wird: Angst, Empoerung, Misstrauen, Feindbild, scheinbare Gewissheit, falscher Kontext oder Auslassung. Bleibe bei belegbarer Wirkung; Motive nicht als Tatsache behaupten.
 
 Antworte exakt in diesen 5 kurzen Zeilen, aber mit echtem Inhalt:
 Bewertung: <Ampel + korrekt/falsch/teilweise/unbelegt/nicht pruefbar>
-Warum: <2-4 Saetze>
-Quellen: <welche Quellen stuetzen/widersprechen, kurz>
-Einordnung: <Zuspitzung/Kontext/Framing, kurz>
+Warum: <3-5 Saetze; Quellenlage, Gegenpruefung, Kontext>
+Quellen: <welche Quellen stuetzen/widersprechen; Primaer/Sekundaer/ungeeignet kurz markieren>
+Einordnung: <Zuspitzung/Kontext/Framing/Wirkung, konkret>
 Nachsuche: <welche gezielte Suche durchgefuehrt wurde; falls nicht ausreichend: genau das transparent sagen, ohne eine Hausaufgabe stehen zu lassen>
 """ % (claim_text, "; ".join(source_lines))
             try:
-                text = call_bifrost(settings, prompt, max_tokens=380)
+                text = call_bifrost(settings, prompt, max_tokens=650)
             except Exception as exc:
                 text = "Bewertung: ⚫ Teilbewertung nicht verfuegbar\nWarum: Der einzelne openai/gpt-5.5-Bewertungsaufruf fuer diese Aussage ist technisch fehlgeschlagen (%s).\nQuellen: Nicht ausgewertet.\nEinordnung: Die Aussage wurde extrahiert, aber in diesem Lauf nicht bewertet.\nNachsuche: Erneuter automatischer Lauf oder manuelle Gegenpruefung erforderlich; keine Sachbewertung aus einem technischen Fehler ableiten." % exc.__class__.__name__
             followup_searches: list[dict] = []
@@ -1120,14 +1172,24 @@ def analyze_message_intent(job_dir: Path, settings: dict, meta: dict, combined_t
     mail_excerpt = re.sub(r"\n{3,}", "\n\n", combined_text or "").strip()[:2500]
     prompt = """Analysiere die moegliche Absicht, das Framing und die rhetorische Wirkung der folgenden Meldung.
 
-Antworte differenziert, nicht parteiisch. Unterscheide klar zwischen belegbarer Absicht und plausibler Wirkung.
+Antworte differenziert, nicht parteiisch. Unterscheide strikt zwischen belegbarer Absicht, plausibler kommunikativer Wirkung und unbewiesenen Motiven.
+Ziel: Lesern klar machen, was mit ihnen kommunikativ versucht werden kann, ohne selbst unbelegte Gegenpropaganda zu erzeugen.
 
 Beantworte:
 - Was soll die Meldung vermutlich beim Leser erreichen?
 - Welche Frames/Deutungsmuster werden gesetzt?
 - Welche sprachlichen Mittel werden genutzt (z. B. Zuspitzung, Delegitimierung, Zweifel saeen, Empoerung, Autoritaetskritik)?
 - Welche Zielgruppe oder Anschlusskommunikation wird wahrscheinlich angesprochen?
-- Wie sollte ein Leser die Meldung kritisch einordnen?
+- Welche Auslassungen, falschen Gegensaetze, Scheinlogiken, Schuldzuweisungen oder Feindbilder sind erkennbar?
+- Welche Emotionen werden aktiviert und wozu koennen sie den Leser bewegen?
+- Wie sollte ein Leser die Meldung kritisch einordnen und gegen welche Manipulationsmuster sollte er sich wappnen?
+
+Pflichtformat:
+1. Vermutete Wirkung: <konkret>
+2. Framing/Technik: <konkret>
+3. Was wird mit dem Leser versucht?: <klar und verstaendlich>
+4. Grenze der Aussage: <was ist belegt, was nur plausible Wirkung>
+5. Kritische Lesart: <praktischer Hinweis>
 
 Betreff: %s
 
@@ -1142,7 +1204,7 @@ Extrahierte Behauptungen:
 ---
 """ % (meta.get("subject") or "(ohne Betreff)", mail_excerpt, claim_excerpt or "Keine extrahierten Behauptungen")
     try:
-        text = call_bifrost(settings, prompt, max_tokens=1200)
+        text = call_bifrost(settings, prompt, max_tokens=1600)
     except Exception as exc:
         text = "Die separate Absicht-/Framing-Analyse konnte in diesem Lauf wegen eines technischen Fehlers im openai/gpt-5.5-Aufruf nicht erzeugt werden (%s). Aus dem Artikelkontext sollte dennoch besonders auf wertende Sprache, Zuspitzungen und selektive Quellenwahl geachtet werden." % exc.__class__.__name__
     (job_dir / "research" / "intent_analysis.txt").write_text(text.strip() + "\n", encoding="utf-8")
@@ -1161,16 +1223,16 @@ def compose_chunked_factcheck(meta: dict, combined_text: str, direct_claims: lis
         "Kurzfazit:",
     ])
     if evaluations:
-        lines.append("Die direkt verlinkte Seite wurde automatisch ausgelesen und abschnittsweise mit openai/gpt-5.5 ausgewertet. Die wichtigsten extrahierten Behauptungen wurden anschliessend in kleinen Gruppen mit automatisch gefundenen Quellen gegengeprueft.")
+        lines.append("Die direkt verlinkte Seite wurde automatisch ausgelesen und abschnittsweise mit openai/gpt-5.5 ausgewertet. Die wichtigsten extrahierten Behauptungen wurden anschliessend einzeln mit mehreren Suchvarianten, Kontextquellen und gezielter Nachsuche gegengeprueft.")
     else:
         lines.append("Es konnten keine belastbaren Link-Behauptungen extrahiert werden; die Bewertung ist dadurch eingeschraenkt.")
     lines.extend([
         "",
         "Gesamtbewertung:",
         "Tatsachenkern: Die verlinkten Inhalte wurden automatisch ausgelesen; aus %d erkannten Hauptaussagen wurden %d Bewertungsbloecke mit Quellenabgleich gebildet. Belastbar sind nur Punkte, die im Abschnitt Faktencheck mit konkretem Quellenbezug gestuetzt werden." % (claim_count, checked_claims),
-        "Framing/Wirkung: Die Darstellung ist nicht nur nach Einzelbehauptungen zu bewerten, sondern auch danach, welche Zusammenhaenge betont, ausgelassen oder emotional zugespitzt werden.",
-        "Absicht: Der erkennbare Zweck liegt darin, Aufmerksamkeit und Zustimmung fuer eine bestimmte Deutung zu erzeugen; unbelegte Motive werden dabei nicht als Tatsache behandelt, sondern als moegliches Framing kenntlich gemacht.",
-        "Kritischer Befund: Einzelne richtige Tatsachenkerne reichen nicht aus, wenn Kontext fehlt oder Schlussfolgerungen weiter gehen als die Quellenlage. Massgeblich ist die Trennung zwischen belegtem Fakt, plausibler Einordnung und unbelegter Zuspitzung.",
+        "Framing/Wirkung: Entscheidend ist nicht nur, ob einzelne Saetze stimmen, sondern welche Zusammenhaenge betont, ausgelassen, emotionalisiert oder zu einer scheinbar zwingenden Deutung zusammengesetzt werden.",
+        "Absicht/Wirkmechanik: Der erkennbare kommunikative Zweck wird als Wirkungshypothese eingeordnet: Welche Gefuehle, Feindbilder, Misstrauensimpulse oder Handlungsbereitschaften angesprochen werden. Unbelegte Motive werden nicht als Tatsache behauptet.",
+        "Kritischer Befund: Einzelne richtige Tatsachenkerne reichen nicht aus, wenn Kontext fehlt oder Schlussfolgerungen weiter gehen als die Quellenlage. Massgeblich ist die Trennung zwischen belegtem Fakt, Deutung, Auslassung und manipulativer Zuspitzung.",
     ])
     lines.extend([
         "",
@@ -1463,7 +1525,7 @@ def make_prompt(meta: dict, combined_text: str, sources: list[dict], direct_link
     if len(prompt_content) > 1800:
         prompt_content = prompt_content[:1800] + "\n\n[Zu pruefender Mailinhalt wegen Laengenlimit gekuerzt]"
     source_lines = []
-    for i, s in enumerate(sources[:5], 1):
+    for i, s in enumerate(sources[:8], 1):
         source_excerpt = (s.get("content") or "")[:280]
         source_lines.append("[%d] %s\nURL: %s\nAuszug: %s" % (i, s.get("title"), s.get("url"), source_excerpt))
     direct_lines = []
@@ -1480,7 +1542,7 @@ def make_prompt(meta: dict, combined_text: str, sources: list[dict], direct_link
         for i, link in enumerate(direct_links or [], 1):
             direct_short_lines.append("[%d] %s\nTitel: %s\nKurzauszug:\n%s" % (i, link.get("url", ""), link.get("title", ""), (link.get("text", "") or "")[:700]))
         short_source_lines = []
-        for i, s in enumerate(sources[:4], 1):
+        for i, s in enumerate(sources[:8], 1):
             short_source_lines.append("[%d] %s\nURL: %s\nAuszug: %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:180]))
         short_mail_content = prompt_content[:1000]
         if len(prompt_content) > 1000:
@@ -1492,12 +1554,14 @@ Regeln:
 - Die Link-Behauptungen wurden zuvor abschnittsweise aus der verlinkten Seite extrahiert; nutze sie als Primaerinhalt.
 - Die Linklekture ist automatisch: Bei sehr langen, JavaScript-lastigen oder blockierten Seiten koennen Inhalte fehlen. Benenne solche Grenzen knapp, falls erkennbar.
 - Die automatisch gefundenen Quellen sind nicht vorab gesichert; bewerte ihre Brauchbarkeit.
-- Keine Markdown-Tabelle. Maximal 3200 Zeichen Antwort.
-- Pruefe maximal die 4 wichtigsten Tatsachenbehauptungen. Fass Dopplungen zusammen.
+- Keine Markdown-Tabelle. Maximal 5200 Zeichen Antwort.
+- Pruefe die wichtigsten Tatsachenbehauptungen gruendlich. Fass Dopplungen zusammen, aber lasse zentrale Gegenargumente nicht weg.
+- Nutze die Quellen nicht nur illustrativ: Suche nach Primaerquelle/Originalzitat/Originaldaten, dann nach unabhaengiger Gegen-/Kontextquelle. Markiere Quellen als Primaerquelle, Kontextquelle, Parteiquelle, Medienbericht oder unbrauchbar/zu allgemein.
 - Nutze kurze Abschnitte: Kurzfazit, Gesamtbewertung, erkannte Aussagen, Faktencheck, Quellenlage, Was fehlt.
 - Direkt unter dem Kurzfazit muss ein eigener Abschnitt stehen: Gesamtbewertung: <ausfuehrliche, kritische Gesamtbewertung>.
-- Gliedere die Gesamtbewertung lesbar in 3-5 kurze Unterpunkte mit Labels wie Tatsachenkern:, Framing/Wirkung:, Absicht:, Kritischer Befund:. Keine Textwand.
-- Die Gesamtbewertung soll knallhart einordnen, was der Verfasser oder Verbreiter des Textes vermutlich erreichen will: Welche Emotionen werden aktiviert, welche Feindbilder/Frames werden gesetzt, welche Auslassungen oder Zuspitzungen lenken die Wahrnehmung, und was bleibt faktisch belastbar?
+- Gliedere die Gesamtbewertung lesbar in 4-6 kurze Unterpunkte mit Labels wie Tatsachenkern:, Quellenstärke:, Framing/Wirkung:, Was wird mit dem Leser versucht?:, Kritischer Befund:. Keine Textwand.
+- Die Gesamtbewertung soll deutlich einordnen, was der Verfasser oder Verbreiter des Textes vermutlich kommunikativ erreichen will: Welche Emotionen werden aktiviert, welche Feindbilder/Frames werden gesetzt, welche Auslassungen oder Zuspitzungen lenken die Wahrnehmung, und was bleibt faktisch belastbar?
+- Erklaere das "Warum" der Bewertung: welche Belege tragen, welche nicht, was fehlt, und warum die Schlussfolgerung der Meldung staerker/schwaecher ist als die Faktenlage.
 - Trenne dabei klar zwischen belegtem Tatsachenkern, Deutung, Propaganda/Framing und nicht belegten Motiven. Keine Parteipolemik, aber deutlich und ungeschönt.
 - Bewerte klar mit Ampel: 🟢 korrekt, 🟡 teilweise/zugespitzt, 🔴 falsch, ⚪ Meinung/nicht pruefbar, ⚫ unbelegt.
 
@@ -1522,7 +1586,7 @@ Automatisch gefundene Gegen-/Kontextquellen:
 %s
 """ % (meta.get("subject") or "(ohne Betreff)", "\n\n".join(claim_lines)[:2600], "\n\n".join(direct_short_lines)[:1000] or "Keine direkten Links erkannt oder abrufbar", short_mail_content, "\n\n".join(short_source_lines) or "Keine Quellen gefunden")
     compact_source_lines = []
-    for i, s in enumerate(sources[:5], 1):
+    for i, s in enumerate(sources[:8], 1):
         compact_source_lines.append("[%d] %s\nURL: %s\nAuszug: %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:220]))
     compact_prompt_content = prompt_content[:1200]
     if len(prompt_content) > 1200:
@@ -1536,7 +1600,7 @@ FAKETEST-ERGEBNIS
 ────────────────────────────────
 Kurzfazit: <Ampel + klare Gesamtbewertung in 2-4 Saetzen>
 
-Gesamtbewertung: <ausfuehrliche, kritische Gesamtbewertung, aber gut lesbar gegliedert. Nutze 3-5 kurze Unterpunkte mit Labels wie Tatsachenkern:, Framing/Wirkung:, Absicht:, Kritischer Befund:. Knallhart einordnen, was der Verfasser oder Verbreiter des Textes vermutlich erreichen will: Welche Emotionen werden aktiviert, welche Feindbilder/Frames werden gesetzt, welche Auslassungen oder Zuspitzungen lenken die Wahrnehmung, und was bleibt faktisch belastbar? Klar trennen zwischen belegtem Tatsachenkern, Deutung, Propaganda/Framing und nicht belegten Motiven. Keine Parteipolemik, aber deutlich und ungeschönt.>
+Gesamtbewertung: <ausfuehrliche, kritische Gesamtbewertung, aber gut lesbar gegliedert. Nutze 4-6 kurze Unterpunkte mit Labels wie Tatsachenkern:, Quellenstärke:, Framing/Wirkung:, Was wird mit dem Leser versucht?:, Kritischer Befund:. Deutlich einordnen, was der Verfasser oder Verbreiter des Textes vermutlich kommunikativ erreichen will: Welche Emotionen werden aktiviert, welche Feindbilder/Frames werden gesetzt, welche Auslassungen oder Zuspitzungen lenken die Wahrnehmung, und was bleibt faktisch belastbar? Klar trennen zwischen belegtem Tatsachenkern, Deutung, Propaganda/Framing, plausibler Wirkung und nicht belegten Motiven. Keine Parteipolemik, aber deutlich und ungeschönt.>
 
 1. ERKANNTER INHALT
 - Rekonstruiere den wahrscheinlich gemeinten Wortlaut. Bei OCR-Fehlern markiere Unsicherheit.
@@ -1545,13 +1609,14 @@ Gesamtbewertung: <ausfuehrliche, kritische Gesamtbewertung, aber gut lesbar gegl
 Fuer jede wichtige Aussage:
 Aussage: <Wortlaut>
 Bewertung: <🟢 korrekt / 🟡 teilweise / 🔴 falsch / ⚪ nicht pruefbar / ⚫ unbelegt>
-Warum: <konkrete Begruendung>
-Quellenbezug: <welche Quelle stuetzt/widerspricht>
-Einordnung: <Kontext, Zuspitzung oder Framing>
+Warum: <konkrete Begruendung mit Quellenlage, Gegenpruefung und Kontext>
+Quellenbezug: <welche Quelle stuetzt/widerspricht; Primaer/Sekundaer/ungeeignet markieren>
+Einordnung: <Kontext, Zuspitzung, Framing, Wirkung und was mit dem Leser versucht wird>
 
 3. QUELLENLAGE
 - Welche automatisch gefundenen Quellen sind brauchbar?
 - Welche sind eingeschraenkt brauchbar oder unbrauchbar?
+- Gibt es Primaerquellen/Originaldaten/Originalzitate? Wenn nein, klar sagen.
 
 4. WAS FEHLT FUER EINE HAERTERE PRUEFUNG?
 - <konkrete fehlende Belege, falls relevant>
@@ -1559,6 +1624,7 @@ Einordnung: <Kontext, Zuspitzung oder Framing>
 Regeln:
 - Quellen wurden automatisch per Websuche gefunden, nicht vom Nutzer vorgegeben und nicht vorab als gesichert festgelegt.
 - Verwende nicht die Formulierungen "gesicherte Quellen", "zugelassene Quellen" oder "vom Nutzer vorgegebene Quellen".
+- Nutze die Quellen gegeneinander: Was stuetzt, was widerspricht, was ist nur Kontext, was passt nicht zur konkreten Behauptung?
 - Bei Bildern/OCR: pruefe den Tatsachenkern auch dann, wenn einzelne Zeichen falsch erkannt wurden.
 - Bei Videos/Transkripten: Nutze Zeit-/Videokontext, falls vorhanden. Veröffentliche oder reproduziere keine fremden Videos, Frames oder Vorschaubilder; arbeite mit Beschreibung, Transkript-Auszügen und Quellen.
 - Wenn Quellen nicht zum Inhalt passen, sage das klar.
@@ -2643,15 +2709,17 @@ def process_job(job_dir: Path, settings: dict) -> None:
         direct_text = "\n\n".join("## Direkt verlinkte Seite %s\nTitel: %s\n%s" % (item.get("url"), item.get("title"), item.get("text")) for item in direct_links if item.get("ok") and item.get("text"))
         query_basis = (direct_text + "\n\n" + combined).strip() if direct_text else combined
         query = build_search_query(meta, query_basis)
-        (job_dir / "research" / "queries.json").write_text(json.dumps({"query": query}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        sources = search_web(settings, query[:500])
+        queries = build_research_queries(settings, meta, query_basis, query[:500])
+        (job_dir / "research" / "queries.json").write_text(json.dumps({"query": query, "queries": queries}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        sources, deep_searches = search_web_deep(settings, queries)
+        (job_dir / "research" / "deep_searches.json").write_text(json.dumps(deep_searches, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (job_dir / "research" / "sources.json").write_text(json.dumps(sources, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if direct_claims:
             evaluations = evaluate_claim_groups(job_dir, settings, direct_claims, sources)
             intent_analysis = analyze_message_intent(job_dir, settings, meta, combined, direct_claims)
             result = compose_chunked_factcheck(meta, combined, direct_claims, evaluations, intent_analysis, sources, job_dir)
         else:
-            result = call_bifrost(settings, make_prompt(meta, combined, sources, direct_links, direct_claims))
+            result = call_bifrost(settings, make_prompt(meta, combined, sources, direct_links, direct_claims), max_tokens=2800)
         if not result.strip():
             raise RuntimeError("Leere Faktencheck-Antwort")
         disclaimer = "\n\n---\nHinweis: Dies ist eine automatische KI-Vorpruefung und kann Fehler enthalten. Bitte wichtige Ergebnisse anhand der Quellen selbst gegenpruefen.\n"
