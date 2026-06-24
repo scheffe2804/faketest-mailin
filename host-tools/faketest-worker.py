@@ -1681,6 +1681,26 @@ def ensure_factcheck_prefix(title: str) -> str:
         return title
     return "Faktencheck: " + title
 
+
+def strip_leading_ocr_noise(title: str) -> str:
+    title = re.sub(r"\s+", " ", title or "").strip(" .,:;–—-„“\"'")
+    title = re.sub(r"(?i)^faktencheck:\s*", "", title).strip()
+    # Social-media screenshots often start with OCR fragments from status bars
+    # such as "1714.0 BASS 77% Uxeine 209". If a readable claim starts later,
+    # prefer that claim over publishing the OCR noise in the page title.
+    match = re.search(
+        r"(?i)\b(Die|Der|Das|Eine|Ein|Europa|Ukraine|Russland|Deutschland|EU|USA|CDU|AfD|ARD|ZDF)\b\s+.{20,}",
+        title,
+    )
+    if match and match.start() > 0:
+        prefix = title[:match.start()].strip()
+        noisy_tokens = re.findall(r"\S+", prefix)
+        has_digits = bool(re.search(r"\d|%", prefix))
+        short_or_weird = sum(1 for token in noisy_tokens if len(re.sub(r"[^A-Za-zÄÖÜäöüß]", "", token)) <= 3 or re.search(r"\d", token))
+        if has_digits and noisy_tokens and short_or_weird / max(1, len(noisy_tokens)) >= 0.5:
+            title = match.group(0).strip(" .,:;–—-„“\"'")
+    return title
+
 def normalize_title_lines(lines: list[str]) -> str:
     out = ""
     for raw in lines:
@@ -1706,6 +1726,8 @@ def is_suspicious_factcheck_title(title: str) -> bool:
     if weird_chars >= 2:
         return True
     tokens = re.findall(r"\S+", text)
+    if tokens[:1] and re.search(r"\d|%", tokens[0]) and len(words) >= 4:
+        return True
     short_noise = sum(1 for token in tokens if re.search(r"[A-Za-zÄÖÜäöüß]", token) and len(re.sub(r"[^A-Za-zÄÖÜäöüß]", "", token)) <= 2)
     if tokens and short_noise / max(1, len(tokens)) > 0.25:
         return True
@@ -1789,9 +1811,9 @@ def derive_factcheck_title(meta: dict, result: str, job_dir: Path | None = None)
                 if sentence_match:
                     candidate = sentence_match.group(1).strip(" .,:;–—-„“\"'")
                     if len(candidate) >= 20:
-                        return limit_factcheck_title(candidate)
+                        return limit_factcheck_title(ensure_factcheck_prefix(strip_leading_ocr_noise(candidate)))
                 elif len(body_line) >= 20:
-                    return limit_factcheck_title(body_line)
+                    return limit_factcheck_title(ensure_factcheck_prefix(strip_leading_ocr_noise(body_line)))
     subject = strip_publish_subject(meta.get("subject") or "")
     if subject and not re.match(r"^[A-Za-z]{1,4}$", subject):
         return limit_factcheck_title(ensure_factcheck_prefix(subject))
