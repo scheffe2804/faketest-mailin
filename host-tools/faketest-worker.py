@@ -2445,9 +2445,10 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
     # The release path below intentionally does not use the normal m11h staging
     # working tree as its mutable checkout. A dirty / wrong-branch / locally
     # broken staging checkout must not block a mail-approved Faktencheck release.
-    # We still inspect m00h's staging runtime before resetting it so that known
-    # WordPress update leftovers can be copied into the isolated release checkout
-    # when explicitly allowed by configuration.
+    # We still inspect m00h's staging runtime before resetting it. Unrelated
+    # WordPress/plugin/theme update leftovers are backed up and discarded for a
+    # mail-approved Faktencheck release; they must not be silently promoted just
+    # because a content publication was approved.
     status = ""
     staging_status_probe = run_cmd(["ssh", str(publish_cfg.get("staging_git_host", "m00h")), "cd %s && git status --porcelain" % shell_quote(staging_dir)], timeout=120)
     if staging_status_probe.returncode == 0:
@@ -2457,8 +2458,8 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
         ok_updates, allowed_updates, blockers = classify_update_changes(status)
         if not ok_updates:
             log_publish(job_dir, "staging git dirty with non-update paths; release will back up and reset m00h staging before deploy: %s" % "; ".join(blockers[:20]))
-        if allowed_updates and not bool(publish_cfg.get("release_allow_update_changes", False)):
-            return False, "Staging-Runtime enthält erkennbare abgeschlossene WordPress-/Theme-/Plugin-Update-Änderungen. Sie werden nicht als inhaltlicher Fehler gewertet, können aber wegen des bestehenden Promote-Flows nicht automatisch live gehen, solange m00h-Staging nicht Git-clean ist. Bitte diese Update-Änderungen bewusst in die m11h-Git-Quelle übernehmen oder auf m00h bereinigen. Befund: " + "; ".join(allowed_updates[:30]), ""
+        if allowed_updates:
+            log_publish(job_dir, "staging git contains update/runtime paths; release will back up and reset them instead of promoting them: %s" % "; ".join(allowed_updates[:30]))
     wp_ok, wp_notes = wp_update_health(settings)
     if not wp_ok:
         return False, "WordPress-/Plugin-Updatezustand unklar: " + "; ".join(wp_notes), ""
@@ -2469,8 +2470,11 @@ def release_to_live(job_dir: Path, settings: dict, meta: dict, title: str, stagi
     message_b64 = base64.b64encode(message.encode("utf-8")).decode("ascii")
     repo_url = str(publish_cfg.get("release_repo_url", "git@github.com:scheffe2804/afd-im-netz.de.git"))
     repo_url_b64 = base64.b64encode(repo_url.encode("utf-8")).decode("ascii")
-    allowed_update_paths = "\n".join(path.strip() for path in allowed_updates)
-    allowed_update_paths_b64 = base64.b64encode(allowed_update_paths.encode("utf-8")).decode("ascii")
+    # Intentionally do not pass allowed update paths into the release checkout.
+    # Faktencheck approval authorizes content publication, not plugin/theme file
+    # promotion. The m00h runtime reset below creates a backup before discarding
+    # such unrelated runtime changes.
+    allowed_update_paths_b64 = ""
     release_script = r'''
 set -euo pipefail
 export GIT_AUTHOR_NAME="Faketest Publisher"
@@ -2525,7 +2529,7 @@ git push origin HEAD:dev >/dev/null
 # This release script itself is streamed to bash via stdin over ssh. The nested
 # SSH call to m00h must therefore not read from stdin, otherwise it can consume
 # the remaining script and silently skip the main merge/live deploy steps.
-ssh -n m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then backup_dir=\"/home/chris/web/backups/faketest-staging-git/\$(date -u +%Y%m%dT%H%M%SZ)-$new_dev\"; mkdir -p \"\$backup_dir\"; git status --porcelain > \"\$backup_dir/status.txt\"; git status --porcelain | awk '{print substr(\$0,4)}' | sed '/^$/d' > \"\$backup_dir/paths.txt\"; tar -czf \"\$backup_dir/dirty-files.tar.gz\" --ignore-failed-read --files-from \"\$backup_dir/paths.txt\" 2>/dev/null || true; echo \"m00h staging runtime dirty; backed up to \$backup_dir and resetting to faketest release commit\" >&2; git reset --hard >/dev/null; git clean -fd >/dev/null; fi; git fetch --prune origin dev >/dev/null; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
+ssh -n m00h "set -euo pipefail; cd /home/chris/web/staging.afd-im-netz.de; normalize_perms() { if docker ps >/dev/null 2>&1; then dc=docker; elif sudo -n docker ps >/dev/null 2>&1; then dc='sudo docker'; else echo 'docker not usable for permission normalization' >&2; return 1; fi; host_gid=\$(id -g); \$dc run --rm -u 0:0 -v /home/chris/web:/work wordpress:php8.2-apache bash -lc \"chown -R 33:\${host_gid} /work/staging.afd-im-netz.de/wp-content && chmod -R ug+rwX /work/staging.afd-im-netz.de/wp-content && find /work/staging.afd-im-netz.de/wp-content -type d -exec chmod g+s {} +\"; }; dirty=\$(git status --porcelain); if [ -n \"\$dirty\" ]; then backup_dir=\"/home/chris/web/backups/faketest-staging-git/\$(date -u +%Y%m%dT%H%M%SZ)-$new_dev\"; mkdir -p \"\$backup_dir\"; git status --porcelain > \"\$backup_dir/status.txt\"; git status --porcelain | awk '{print substr(\$0,4)}' | sed '/^$/d' > \"\$backup_dir/paths.txt\"; tar -czf \"\$backup_dir/dirty-files.tar.gz\" --ignore-failed-read --files-from \"\$backup_dir/paths.txt\" 2>/dev/null || true; echo \"m00h staging runtime dirty; backed up to \$backup_dir and resetting to faketest release commit\" >&2; normalize_perms; git reset --hard >/dev/null; git clean -fd >/dev/null; fi; git fetch --prune origin dev >/dev/null; normalize_perms; git reset --hard '$new_dev' >/dev/null; current=\$(git rev-parse HEAD); if [ \"\$current\" != '$new_dev' ]; then echo \"m00h staging runtime sync failed: \$current != $new_dev\" >&2; exit 28; fi"
 git clone --origin origin "$repo_url" "$main_worktree" >/dev/null
 cd "$main_worktree"
 git fetch --prune origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/heads/main:refs/remotes/origin/main' >/dev/null
