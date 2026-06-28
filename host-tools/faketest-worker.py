@@ -26,6 +26,10 @@ SETTINGS_PATH = Path("/etc/faketest/settings.json")
 LOCK_SUFFIX = ".lock"
 
 
+class VideoAwaitingReply(Exception):
+    pass
+
+
 def load_settings() -> dict:
     return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
 
@@ -111,6 +115,10 @@ def generate_publish_token() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     raw = "".join(secrets.choice(alphabet) for _ in range(12))
     return "%s-%s-%s" % (raw[:4], raw[4:8], raw[8:12])
+
+
+def generate_short_token() -> str:
+    return generate_publish_token()
 
 
 def ensure_publish_token(job_dir: Path, meta: dict, settings: dict) -> str:
@@ -261,16 +269,182 @@ def extract_video_audio(job_dir: Path, path: Path, settings: dict) -> tuple[Path
     audio_dir = job_dir / "extracted" / "video-audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
     audio_path = audio_dir / (path.stem + ".wav")
-    proc = run_cmd([
-        "ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-t", str(int(cfg.get("max_audio_seconds", 1800) or 1800)), str(audio_path)
-    ], timeout=timeout)
+    args = ["ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000"]
+    max_audio_seconds = int(cfg.get("max_audio_seconds", 1800) or 0)
+    if max_audio_seconds > 0:
+        args.extend(["-t", str(max_audio_seconds)])
+    args.append(str(audio_path))
+    proc = run_cmd(args, timeout=timeout)
     if proc.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
         return None, "Audio konnte nicht aus Video extrahiert werden (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
     return audio_path, None
 
 
+def format_seconds_hhmmss(seconds: float | int) -> str:
+    total = max(0, int(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
+def video_progress_path(job_dir: Path) -> Path:
+    return job_dir / "video" / "video-progress.json"
+
+
+def load_video_progress(job_dir: Path) -> dict:
+    path = video_progress_path(job_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_video_progress(job_dir: Path, progress: dict) -> None:
+    path = video_progress_path(job_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(progress, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def ensure_video_token(progress: dict, key: str) -> str:
+    token_key = key + "_token"
+    token = str(progress.get(token_key) or "").strip().upper()
+    if not token:
+        token = generate_short_token()
+        progress[token_key] = token
+        progress[token_key + "_created_at"] = now_utc().isoformat(timespec="seconds")
+        progress[token_key + "_expires_at"] = (now_utc() + timedelta(days=2)).isoformat(timespec="seconds")
+    return token
+
+
+def rotate_video_token(progress: dict, key: str) -> None:
+    for suffix in ("_token", "_token_created_at", "_token_expires_at"):
+        progress.pop(key + suffix, None)
+
+
+def video_token_expired(progress: dict, key: str) -> bool:
+    expires = parse_dt(str(progress.get(key + "_token_expires_at") or ""))
+    return bool(expires and now_utc() > expires)
+
+
+def append_limited(progress: dict, key: str, item: dict, limit: int = 20) -> None:
+    items = progress.setdefault(key, [])
+    items.append(item)
+    if len(items) > limit:
+        del items[:-limit]
+
+
+def redacted_video_request(request: dict) -> dict:
+    clean = dict(request)
+    if clean.get("token"):
+        clean["token"] = "[REDACTED]"
+    return clean
+
+
+def consume_video_continue_request(job_dir: Path, settings: dict, progress: dict, expected_action: str, expected_token: str) -> bool:
+    request_path = job_dir / "video_continue_request.json"
+    if not request_path.exists():
+        return False
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    publish_cfg = settings.get("publish", {})
+    allowed_sender = str(publish_cfg.get("allowed_sender", "chrisheidingsfelder@gmail.com")).strip().lower()
+    sender = str(request.get("requested_by") or "").strip().lower()
+    if sender != allowed_sender:
+        request["status"] = "rejected_invalid_sender"
+        request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return False
+    if str(request.get("action") or "").upper() != expected_action:
+        return False
+    token_key = "next" if expected_action == "NEXT" else "synthesis"
+    if video_token_expired(progress, token_key):
+        request["status"] = "rejected_expired_token"
+        request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        append_limited(progress, "rejected_requests", redacted_video_request(request))
+        save_video_progress(job_dir, progress)
+        return False
+    if str(request.get("token") or "").upper() != expected_token:
+        request["status"] = "rejected_invalid_token"
+        request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        append_limited(progress, "rejected_requests", redacted_video_request(request))
+        save_video_progress(job_dir, progress)
+        return False
+    request["status"] = "consumed"
+    request["consumed_at"] = now_utc().isoformat(timespec="seconds")
+    append_limited(progress, "consumed_requests", redacted_video_request(request))
+    rotate_video_token(progress, token_key)
+    save_video_progress(job_dir, progress)
+    request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        request_path.rename(job_dir / "video" / ("consumed-%s-%s.json" % (expected_action.lower(), now_utc().strftime("%Y%m%dT%H%M%SZ"))))
+    except Exception:
+        try:
+            request_path.unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def send_video_continue_mail(settings: dict, meta: dict, progress: dict, chunk_index: int, total_chunks: int, block_text: str) -> None:
+    token = ensure_video_token(progress, "next")
+    excerpt = block_text.strip()
+    if len(excerpt) > 3500:
+        excerpt = excerpt[:3500] + "\n\n[Zwischenanalyse/Transkript-Auszug wegen Laengenlimit gekuerzt]"
+    subject = "[Faketest Video][FT-VID %s NEXT %s] Block %d von %d fertig" % (meta["job_id"], token, chunk_index, total_chunks)
+    body = """Video-Block %d von %d ist fertig.
+
+Dies ist ein Zwischenstand, keine abschließende Faktencheck-Bewertung. Spätere Video-Blöcke können Aussagen relativieren oder Kontext ergänzen.
+
+Wenn du den nächsten Block bearbeiten willst, antworte einfach auf diese Mail.
+Nicht antworten = Verarbeitung pausiert.
+
+Code im Betreff: FT-VID %s NEXT %s
+
+Auszug:
+
+%s
+""" % (chunk_index, total_chunks, meta["job_id"], token, excerpt)
+    send_mail(settings, meta["reply_to"], subject, body, meta["job_id"], meta.get("message_id"))
+
+
+def send_video_synthesis_mail(settings: dict, meta: dict, progress: dict, total_chunks: int) -> None:
+    token = ensure_video_token(progress, "synthesis")
+    subject = "[Faketest Video][FT-VID %s SYNTHESIS %s] Alle %d Blöcke fertig" % (meta["job_id"], token, total_chunks)
+    body = """Alle %d Video-Blöcke sind transkribiert.
+
+Wenn du jetzt die Gesamtanalyse/Faktencheck-Synthese erstellen willst, antworte einfach auf diese Mail.
+Nicht antworten = Job bleibt mit fertigen Block-Transkripten pausiert.
+
+Code im Betreff: FT-VID %s SYNTHESIS %s
+""" % (total_chunks, meta["job_id"], token)
+    send_mail(settings, meta["reply_to"], subject, body, meta["job_id"], meta.get("message_id"))
+
+
+def extract_video_audio_chunk(job_dir: Path, path: Path, settings: dict, chunk_index: int, start_seconds: float, duration_seconds: float) -> tuple[Path | None, str | None]:
+    cfg = settings.get("video", {})
+    timeout = int(cfg.get("ffmpeg_timeout_seconds", 300) or 300)
+    audio_dir = job_dir / "extracted" / "video-audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = audio_dir / (path.stem + "-chunk-%03d.wav" % chunk_index)
+    args = [
+        "ffmpeg", "-y",
+        "-ss", str(max(0, int(start_seconds))),
+        "-i", str(path),
+        "-vn", "-ac", "1", "-ar", "16000",
+        "-t", str(max(1, int(duration_seconds))),
+        str(audio_path),
+    ]
+    proc = run_cmd(args, timeout=timeout)
+    if proc.returncode != 0 or not audio_path.exists() or audio_path.stat().st_size == 0:
+        return None, "Audio-Chunk %03d konnte nicht aus Video extrahiert werden (%s)" % (chunk_index, (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260]))
+    return audio_path, None
+
+
 def transcribe_audio(audio_path: Path, settings: dict) -> tuple[str, str | None]:
     cfg = settings.get("video", {})
+    if bool(cfg.get("remote_transcribe_enabled", False)):
+        return transcribe_audio_remote(audio_path, settings)
     command_template = str(cfg.get("transcribe_command") or "").strip()
     if not command_template:
         return "", "Keine Video-Transkription konfiguriert (video.transcribe_command fehlt)"
@@ -285,7 +459,147 @@ def transcribe_audio(audio_path: Path, settings: dict) -> tuple[str, str | None]
     return text, None
 
 
-def extract_video(job_dir: Path, path: Path, settings: dict) -> tuple[str, str | None]:
+def safe_remote_name(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem).strip("._-") or "audio"
+    return "%s-%s%s" % (now_utc().strftime("%Y%m%dT%H%M%SZ"), secrets.token_hex(6), path.suffix or ".wav")
+
+
+def transcribe_audio_remote(audio_path: Path, settings: dict) -> tuple[str, str | None]:
+    cfg = settings.get("video", {})
+    host = str(cfg.get("remote_transcribe_host") or "").strip()
+    if not host:
+        return "", "Remote-Video-Transkription ist aktiviert, aber video.remote_transcribe_host fehlt"
+    timeout = int(cfg.get("transcribe_timeout_seconds", 900) or 900)
+    remote_dir = str(cfg.get("remote_transcribe_dir") or "/tmp/faketest-transcribe-remote").strip()
+    command_template = str(cfg.get("remote_transcribe_command") or cfg.get("transcribe_command") or "").strip()
+    if not command_template:
+        return "", "Keine Remote-Video-Transkription konfiguriert (video.remote_transcribe_command fehlt)"
+    remote_path = remote_dir.rstrip("/") + "/" + safe_remote_name(audio_path)
+    mkdir_proc = run_cmd(["ssh", host, "mkdir -p %s && chmod 700 %s" % (shell_quote(remote_dir), shell_quote(remote_dir))], timeout=30)
+    if mkdir_proc.returncode != 0:
+        return "", "Remote-Transkriptionsziel konnte nicht vorbereitet werden (%s)" % (((mkdir_proc.stderr or mkdir_proc.stdout or "").strip() or "rc=%s" % mkdir_proc.returncode)[:260])
+    copy_proc = run_cmd(["scp", "-q", str(audio_path), "%s:%s" % (host, remote_path)], timeout=max(60, min(timeout, 300)))
+    if copy_proc.returncode != 0:
+        return "", "Audio konnte nicht zur Remote-Transkription kopiert werden (%s)" % (((copy_proc.stderr or copy_proc.stdout or "").strip() or "rc=%s" % copy_proc.returncode)[:260])
+    remote_command = command_template.format(audio=shell_quote(remote_path), audio_path=shell_quote(remote_path))
+    try:
+        proc = run_cmd(["ssh", host, "bash -lc %s" % shell_quote(remote_command)], timeout=timeout + 60)
+        if proc.returncode != 0:
+            return "", "Remote-Video-Transkription fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:260])
+        text = (proc.stdout or "").strip()
+        if not text:
+            return "", "Remote-Video-Transkription lieferte keinen Text"
+        return text, None
+    finally:
+        run_cmd(["ssh", host, "rm -f -- %s" % shell_quote(remote_path)], timeout=30)
+
+
+def transcribe_video_in_chunks(job_dir: Path, path: Path, settings: dict, duration: float | None, meta: dict | None = None) -> tuple[str, str | None]:
+    cfg = settings.get("video", {})
+    chunk_seconds = int(cfg.get("chunk_seconds", 1800) or 0)
+    if chunk_seconds <= 0 or duration is None or duration <= chunk_seconds:
+        audio_path, audio_err = extract_video_audio(job_dir, path, settings)
+        if audio_err or audio_path is None:
+            return "", audio_err
+        try:
+            transcript, transcript_err = transcribe_audio(audio_path, settings)
+            if transcript_err:
+                return "", transcript_err
+            return transcript, None
+        finally:
+            cleanup_video_artifact(audio_path, settings, "Extrahierte Audiodatei")
+
+    overlap = max(0, int(cfg.get("chunk_overlap_seconds", 30) or 0))
+    max_chunks = int(cfg.get("max_chunks_per_run", 0) or 0)
+    gated = bool(cfg.get("mail_gate_enabled", True)) and meta is not None
+    transcripts: list[str] = []
+    errors: list[str] = []
+    chunk_dir = job_dir / "extracted" / "video-chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    total_chunks = max(1, int((duration + chunk_seconds - 1) // chunk_seconds))
+    progress = load_video_progress(job_dir) if gated else {}
+    if gated and not progress:
+        progress = {
+            "mode": "video_chunked_mail_gate",
+            "created_at": now_utc().isoformat(timespec="seconds"),
+            "duration_seconds": duration,
+            "chunk_seconds": chunk_seconds,
+            "chunk_overlap_seconds": overlap,
+            "total_chunks": total_chunks,
+            "completed_chunks": [],
+            "next_chunk": 1,
+            "awaiting_reply": False,
+            "synthesis_ready": False,
+            "synthesis_done": False,
+        }
+    if gated and progress.get("synthesis_ready") and not progress.get("synthesis_done"):
+        token = ensure_video_token(progress, "synthesis")
+        if not consume_video_continue_request(job_dir, settings, progress, "SYNTHESIS", token):
+            save_video_progress(job_dir, progress)
+            raise VideoAwaitingReply("Video-Blöcke fertig; warte auf Antwort für Gesamtanalyse")
+        progress["synthesis_done"] = True
+        progress["awaiting_reply"] = False
+        save_video_progress(job_dir, progress)
+        combined_existing = []
+        for transcript_path in sorted(chunk_dir.glob("chunk-*.transcript.txt")):
+            combined_existing.append(transcript_path.read_text(encoding="utf-8", errors="replace").strip())
+        return "\n\n".join(x for x in combined_existing if x), None
+    if gated and progress.get("awaiting_reply"):
+        token = ensure_video_token(progress, "next")
+        if not consume_video_continue_request(job_dir, settings, progress, "NEXT", token):
+            save_video_progress(job_dir, progress)
+            raise VideoAwaitingReply("Video wartet auf Antwort für nächsten Block")
+        progress["awaiting_reply"] = False
+    start_chunk = int(progress.get("next_chunk", 1) or 1) if gated else 1
+    chunk_index = start_chunk
+    while chunk_index <= total_chunks:
+        if max_chunks > 0 and chunk_index > max_chunks:
+            start_for_msg = (chunk_index - 1) * chunk_seconds
+            transcripts.append("## Video-Block-Limit erreicht\nWeitere Blöcke ab %s wurden in diesem Lauf nicht transkribiert." % format_seconds_hhmmss(start_for_msg))
+            break
+        start = float((chunk_index - 1) * chunk_seconds)
+        effective_start = max(0.0, start - overlap if chunk_index > 1 else start)
+        end = min(duration, start + chunk_seconds)
+        extract_duration = max(1.0, end - effective_start)
+        audio_path, audio_err = extract_video_audio_chunk(job_dir, path, settings, chunk_index, effective_start, extract_duration)
+        if audio_err or audio_path is None:
+            errors.append(audio_err or "Audio-Chunk %03d konnte nicht erstellt werden" % chunk_index)
+        else:
+            try:
+                transcript, transcript_err = transcribe_audio(audio_path, settings)
+                if transcript_err:
+                    errors.append("Block %03d (%s-%s): %s" % (chunk_index, format_seconds_hhmmss(effective_start), format_seconds_hhmmss(end), transcript_err))
+                else:
+                    block_text = "## Video-Block %03d (%s-%s)\n%s" % (chunk_index, format_seconds_hhmmss(effective_start), format_seconds_hhmmss(end), transcript.strip())
+                    transcripts.append(block_text)
+                    (chunk_dir / ("chunk-%03d.transcript.txt" % chunk_index)).write_text(block_text + "\n", encoding="utf-8")
+                    if gated:
+                        completed = set(int(x) for x in progress.get("completed_chunks", []) if str(x).isdigit())
+                        completed.add(chunk_index)
+                        progress["completed_chunks"] = sorted(completed)
+                        progress["next_chunk"] = chunk_index + 1
+                        progress["updated_at"] = now_utc().isoformat(timespec="seconds")
+                        if chunk_index < total_chunks:
+                            progress["awaiting_reply"] = True
+                            send_video_continue_mail(settings, meta or {}, progress, chunk_index, total_chunks, block_text)
+                            save_video_progress(job_dir, progress)
+                            raise VideoAwaitingReply("Video-Block %d/%d fertig; warte auf Antwort" % (chunk_index, total_chunks))
+                        progress["synthesis_ready"] = True
+                        progress["awaiting_reply"] = True
+                        send_video_synthesis_mail(settings, meta or {}, progress, total_chunks)
+                        save_video_progress(job_dir, progress)
+                        raise VideoAwaitingReply("Alle Video-Blöcke fertig; warte auf Antwort für Gesamtanalyse")
+            finally:
+                cleanup_video_artifact(audio_path, settings, "Audio-Chunk %03d" % chunk_index)
+        chunk_index += 1
+    if not transcripts:
+        return "", "; ".join(errors) or "Keine Video-Chunks transkribiert"
+    if errors:
+        transcripts.append("## Hinweise zu fehlgeschlagenen Video-Bloecken\n" + "\n".join("- " + err for err in errors))
+    return "\n\n".join(transcripts), None
+
+
+def extract_video(job_dir: Path, path: Path, settings: dict, meta: dict | None = None) -> tuple[str, str | None]:
     cfg = settings.get("video", {})
     if not bool(cfg.get("enabled", True)):
         return "", "Video-Verarbeitung ist deaktiviert"
@@ -293,17 +607,13 @@ def extract_video(job_dir: Path, path: Path, settings: dict) -> tuple[str, str |
     if meta_err:
         return "", meta_err
     duration = video_duration_seconds(metadata)
-    max_seconds = float(cfg.get("max_duration_seconds", 1800) or 1800)
+    max_seconds = float(cfg.get("max_duration_seconds", 1800) or 0)
     metadata_text = summarize_video_metadata(path, metadata)
-    if duration is not None and duration > max_seconds:
+    if max_seconds > 0 and duration is not None and duration > max_seconds:
         return "## Videometadaten\n%s" % metadata_text, "Video ist zu lang fuer automatische Transkription (%.1f Sekunden > %.1f Sekunden)" % (duration, max_seconds)
-    audio_path: Path | None = None
     cleanup_notes: list[str] = []
     try:
-        audio_path, audio_err = extract_video_audio(job_dir, path, settings)
-        if audio_err or audio_path is None:
-            return "## Videometadaten\n%s" % metadata_text, audio_err
-        transcript, transcript_err = transcribe_audio(audio_path, settings)
+        transcript, transcript_err = transcribe_video_in_chunks(job_dir, path, settings, duration, meta)
         if transcript_err:
             return "## Videometadaten\n%s" % metadata_text, transcript_err
         max_chars = int(cfg.get("max_transcript_chars", 60000) or 60000)
@@ -311,9 +621,6 @@ def extract_video(job_dir: Path, path: Path, settings: dict) -> tuple[str, str |
             transcript = transcript[:max_chars] + "\n\n[Transkript wegen Laengenlimit gekuerzt]"
         return "## Videometadaten\n%s\n\n## Automatisches Transkript\n%s" % (metadata_text, transcript), None
     finally:
-        note = cleanup_video_artifact(audio_path, settings, "Extrahierte Audiodatei")
-        if note:
-            cleanup_notes.append(note)
         if bool(cfg.get("delete_original_video_after_processing", False)):
             note = cleanup_video_artifact(path, settings, "Original-/Download-Video")
             if note:
@@ -357,7 +664,7 @@ def extract_attachments(job_dir: Path, meta: dict, settings: dict) -> tuple[str,
         elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}:
             text, err = extract_image(path)
         elif suffix in VIDEO_SUFFIXES:
-            text, err = extract_video(job_dir, path, settings)
+            text, err = extract_video(job_dir, path, settings, meta)
         elif suffix == ".txt":
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -537,7 +844,9 @@ def build_research_queries(settings: dict, meta: dict, combined_text: str, prima
     if subject and subject.lower() not in {"fwd:", "fw:", "re:", "aw:"}:
         add(subject + " Faktencheck Quellen")
     add(primary_query + " Originalquelle Primärquelle")
+    add(primary_query + " Quelle Beleg Nachweis")
     add(primary_query + " Faktencheck Kontext")
+    add(primary_query + " Recherche Hintergrund")
     add(primary_query + " offiziell Statistik Behörde")
     add(primary_query + " Kritik Gegenargument Einordnung")
 
@@ -581,7 +890,7 @@ def is_likely_video_url(url: str) -> bool:
     return suffix in VIDEO_SUFFIXES
 
 
-def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict) -> dict:
+def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict, meta: dict | None = None) -> dict:
     cfg = settings.get("video", {})
     video_dir = job_dir / "research" / "direct-videos"
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -598,12 +907,12 @@ def fetch_direct_video(job_dir: Path, url: str, index: int, settings: dict) -> d
     original_delete = bool(cfg.get("delete_original_video_after_processing", False))
     cfg["delete_original_video_after_processing"] = bool(cfg.get("delete_downloaded_video_after_processing", True))
     try:
-        text, err = extract_video(job_dir, target, settings)
+        text, err = extract_video(job_dir, target, settings, meta)
     finally:
         cfg["delete_original_video_after_processing"] = original_delete
     if err:
         item["error"] = err
-    if text:
+    if text and not err:
         item.update({"ok": True, "title": "Direktes Video", "text": "Direkt verlinktes Video: %s\n\n%s" % (url, text)})
         (video_dir / ("video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
     return item
@@ -623,7 +932,21 @@ def is_video_page_candidate(url: str, settings: dict) -> bool:
     return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts)
 
 
-def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dict:
+def yt_dlp_common_options(cfg: dict, work_dir: Path) -> list[str]:
+    opts = [
+        "--no-playlist",
+        "--no-update",
+        "--cache-dir", str(work_dir / "yt-dlp-cache"),
+        "--js-runtimes", str(cfg.get("yt_dlp_js_runtimes") or "node:/usr/bin/node"),
+        "--remote-components", str(cfg.get("yt_dlp_remote_components") or "ejs:github"),
+    ]
+    cookies_file = str(cfg.get("yt_dlp_cookies_file") or "").strip()
+    if cookies_file:
+        opts.extend(["--cookies", cookies_file])
+    return opts
+
+
+def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict, meta: dict | None = None) -> dict:
     cfg = settings.get("video", {})
     video_dir = job_dir / "research" / "video-pages"
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -631,8 +954,17 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
     max_bytes = int(cfg.get("max_download_bytes", settings.get("limits", {}).get("attachment_bytes", 15728640)) or 15728640)
     timeout = int(cfg.get("download_timeout_seconds", 180) or 180)
     ytdlp = str(cfg.get("yt_dlp_command") or "yt-dlp")
+    def existing_video_candidates() -> list[Path]:
+        return sorted([
+            p for p in video_dir.glob("page-video-%02d.*" % index)
+            if p.is_file()
+            and p.stat().st_size > 0
+            and p.suffix.lower() not in {".part", ".json", ".txt"}
+            and not p.name.endswith(".part")
+        ], key=lambda p: p.stat().st_size, reverse=True)
+
     metadata: dict = {}
-    metadata_proc = run_cmd([ytdlp, "--no-playlist", "--skip-download", "--dump-json", url], timeout=90)
+    metadata_proc = run_cmd([ytdlp, *yt_dlp_common_options(cfg, video_dir), "--skip-download", "--dump-json", url], timeout=90)
     if metadata_proc.returncode == 0 and (metadata_proc.stdout or "").strip():
         try:
             metadata = json.loads((metadata_proc.stdout or "").splitlines()[-1])
@@ -644,9 +976,64 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
     video_title = str(metadata.get("title") or "").strip()
     display_title = " - ".join(part for part in (channel, video_title) if part) or "Video-Seite"
 
+    original_duration = None
+    try:
+        original_duration = float(metadata.get("duration") or 0) or None
+    except Exception:
+        original_duration = None
+    chunk_seconds = int(cfg.get("chunk_seconds", 1800) or 0)
+    gated = bool(cfg.get("mail_gate_enabled", True)) and meta is not None and chunk_seconds > 0 and original_duration and original_duration > chunk_seconds
+    progress: dict = {}
+    section_start = 0.0
+    section_end = original_duration or 0.0
+    total_chunks = 1
+    if gated:
+        total_chunks = max(1, int((float(original_duration) + chunk_seconds - 1) // chunk_seconds))
+        progress = load_video_progress(job_dir)
+        if not progress:
+            progress = {
+                "mode": "video_chunked_mail_gate",
+                "created_at": now_utc().isoformat(timespec="seconds"),
+                "video_url": url,
+                "duration_seconds": original_duration,
+                "chunk_seconds": chunk_seconds,
+                "chunk_overlap_seconds": int(cfg.get("chunk_overlap_seconds", 30) or 0),
+                "total_chunks": total_chunks,
+                "completed_chunks": [],
+                "next_chunk": 1,
+                "awaiting_reply": False,
+                "synthesis_ready": False,
+                "synthesis_done": False,
+            }
+        if progress.get("synthesis_ready") and not progress.get("synthesis_done"):
+            token = ensure_video_token(progress, "synthesis")
+            if not consume_video_continue_request(job_dir, settings, progress, "SYNTHESIS", token):
+                save_video_progress(job_dir, progress)
+                raise VideoAwaitingReply("Video-Blöcke fertig; warte auf Antwort für Gesamtanalyse")
+            progress["synthesis_done"] = True
+            progress["awaiting_reply"] = False
+            save_video_progress(job_dir, progress)
+            chunk_dir = job_dir / "extracted" / "video-chunks"
+            combined_existing = [p.read_text(encoding="utf-8", errors="replace").strip() for p in sorted(chunk_dir.glob("chunk-*.transcript.txt"))]
+            item = {"url": url, "ok": True, "title": display_title, "video_title": video_title, "channel": channel, "text": "", "error": "", "kind": "video-page"}
+            item["text"] = "Öffentlich verlinkte Video-Seite: %s\nTitel: %s\n\n%s" % (url, display_title, "\n\n".join(x for x in combined_existing if x))
+            (video_dir / ("page-video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
+            return item
+        if progress.get("awaiting_reply"):
+            token = ensure_video_token(progress, "next")
+            if not consume_video_continue_request(job_dir, settings, progress, "NEXT", token):
+                save_video_progress(job_dir, progress)
+                raise VideoAwaitingReply("Video wartet auf Antwort für nächsten Block")
+            progress["awaiting_reply"] = False
+        next_chunk = int(progress.get("next_chunk", 1) or 1)
+        overlap = max(0, int(cfg.get("chunk_overlap_seconds", 30) or 0))
+        section_start = max(0.0, float((next_chunk - 1) * chunk_seconds) - (overlap if next_chunk > 1 else 0))
+        section_end = min(float(original_duration), float(next_chunk * chunk_seconds))
+        target_template = video_dir / ("page-video-%02d-chunk-%03d.%%(ext)s" % (index, next_chunk))
+
     command = [
         ytdlp,
-        "--no-playlist",
+        *yt_dlp_common_options(cfg, video_dir),
         "--max-filesize", str(max_bytes),
         "--socket-timeout", str(max(10, min(timeout, 120))),
         "--format", str(cfg.get("yt_dlp_format") or "bv*+ba/best"),
@@ -654,31 +1041,57 @@ def fetch_video_page(job_dir: Path, url: str, index: int, settings: dict) -> dic
         "--output", str(target_template),
         url,
     ]
+    if gated:
+        command[1:1] = ["--download-sections", "*%s-%s" % (format_seconds_hhmmss(section_start), format_seconds_hhmmss(section_end))]
     item = {"url": url, "ok": False, "title": display_title, "video_title": video_title, "channel": channel, "text": "", "error": "", "kind": "video-page"}
-    proc = run_cmd(command, timeout=timeout + 120)
-    if proc.returncode != 0:
-        item["error"] = "yt-dlp Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:400])
-        return item
-    candidates = sorted([p for p in video_dir.glob("page-video-%02d.*" % index) if p.is_file() and p.stat().st_size > 0], key=lambda p: p.stat().st_size, reverse=True)
+    candidates = existing_video_candidates()
+    proc = None
     if not candidates:
+        proc = run_cmd(command, timeout=timeout + 120)
+        candidates = existing_video_candidates()
+    if not candidates:
+        if proc is not None and proc.returncode != 0:
+            item["error"] = "yt-dlp Download fehlgeschlagen (%s)" % (((proc.stderr or proc.stdout or "").strip() or "rc=%s" % proc.returncode)[:400])
+            return item
         item["error"] = "yt-dlp lieferte keine Videodatei"
         return item
     video_path = candidates[0]
     original_delete = bool(cfg.get("delete_original_video_after_processing", False))
     cfg["delete_original_video_after_processing"] = bool(cfg.get("delete_downloaded_video_after_processing", True))
     try:
-        text, err = extract_video(job_dir, video_path, settings)
+        text, err = extract_video(job_dir, video_path, settings, meta)
     finally:
         cfg["delete_original_video_after_processing"] = original_delete
     if err:
         item["error"] = err
-    if text:
+    if text and not err:
+        if gated:
+            next_chunk = int(progress.get("next_chunk", 1) or 1)
+            block_text = "## Video-Block %03d (%s-%s)\n%s" % (next_chunk, format_seconds_hhmmss(section_start), format_seconds_hhmmss(section_end), text.strip())
+            chunk_dir = job_dir / "extracted" / "video-chunks"
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            (chunk_dir / ("chunk-%03d.transcript.txt" % next_chunk)).write_text(block_text + "\n", encoding="utf-8")
+            completed = set(int(x) for x in progress.get("completed_chunks", []) if str(x).isdigit())
+            completed.add(next_chunk)
+            progress["completed_chunks"] = sorted(completed)
+            progress["next_chunk"] = next_chunk + 1
+            progress["updated_at"] = now_utc().isoformat(timespec="seconds")
+            if next_chunk < total_chunks:
+                progress["awaiting_reply"] = True
+                send_video_continue_mail(settings, meta or {}, progress, next_chunk, total_chunks, block_text)
+                save_video_progress(job_dir, progress)
+                raise VideoAwaitingReply("Video-Block %d/%d fertig; warte auf Antwort" % (next_chunk, total_chunks))
+            progress["synthesis_ready"] = True
+            progress["awaiting_reply"] = True
+            send_video_synthesis_mail(settings, meta or {}, progress, total_chunks)
+            save_video_progress(job_dir, progress)
+            raise VideoAwaitingReply("Alle Video-Blöcke fertig; warte auf Antwort für Gesamtanalyse")
         item.update({"ok": True, "title": display_title, "text": "Öffentlich verlinkte Video-Seite: %s\nTitel: %s\nLokale Analyse-Datei: %s\n\n%s" % (url, display_title, video_path.name, text)})
         (video_dir / ("page-video-%02d.txt" % index)).write_text(item["text"] + "\n", encoding="utf-8")
     return item
 
 
-def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[dict]:
+def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict, meta: dict | None = None) -> list[dict]:
     out: list[dict] = []
     direct_dir = job_dir / "research" / "direct-links"
     direct_dir.mkdir(parents=True, exist_ok=True)
@@ -687,10 +1100,10 @@ def fetch_direct_links(job_dir: Path, urls: list[str], settings: dict) -> list[d
     for index, url in enumerate(urls[:limit], 1):
         item = {"url": url, "ok": False, "title": "", "text": "", "error": ""}
         if is_likely_video_url(url):
-            out.append(fetch_direct_video(job_dir, url, index, settings))
+            out.append(fetch_direct_video(job_dir, url, index, settings, meta))
             continue
         if is_video_page_candidate(url, settings):
-            out.append(fetch_video_page(job_dir, url, index, settings))
+            out.append(fetch_video_page(job_dir, url, index, settings, meta))
             continue
         if is_likely_binary_url(url):
             item["error"] = "binary/asset URL skipped"
@@ -1064,7 +1477,7 @@ def followup_research_for_evaluation(job_dir: Path, settings: dict, group_index:
         revised = re.sub(r"\n{3,}", "\n\n", revised).strip()
         if not re.search(r"(?im)^Bewertung\s*:", revised):
             revised = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\n" + revised
-        revised += "\nNachsuche: Gezielt gesucht nach: %s. Es wurden keine ausreichend passenden Quellen gefunden. Deshalb wird aus dem Quellenmangel keine Negativbewertung abgeleitet." % searched
+        revised += "\nNachsuche: Gezielt gesucht nach: %s. In diesem automatischen Lauf wurden keine ausreichend passenden Quellen gefunden. Das bedeutet nicht, dass keine Quellen existieren; deshalb wird aus dem Quellenmangel keine Negativbewertung abgeleitet." % searched
         return revised.strip(), searches, merged
     source_lines = []
     for i, s in enumerate(merged[:8], 1):
@@ -1090,7 +1503,7 @@ Gezielte Nachsuche:
 Antworte in diesen Zeilen:
 Bewertung: <Ampel + Status>
 Warum: <2-4 Sätze mit Nachsuche-Ergebnis>
-Quellen: <konkrete Treffer oder "keine ausreichenden Treffer", mit [Nr.]>
+Quellen: <konkrete Treffer oder "in diesem automatischen Lauf nicht ausreichend gefunden", mit [Nr.]>
 Einordnung: <Kontext/Framing>
 Nachsuche: <welche gezielten Suchziele abgearbeitet wurden und was noch nicht belastbar ist>
 """ % (claim_text, evaluation, "\n".join(source_lines))
@@ -1126,7 +1539,7 @@ def evaluate_claim_groups(job_dir: Path, settings: dict, direct_claims: list[dic
                 source_lines.append("[%d] %s | %s | %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:260]))
             (eval_dir / ("group-%02d-sources.json" % group_index)).write_text(json.dumps({"query": targeted_query, "sources": targeted_sources}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             if not source_lines:
-                text = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\nWarum: Für diese konkrete Aussage wurden keine passenden gezielten Quellen gefunden. Aus fehlenden Treffern darf nicht abgeleitet werden, dass die Aussage falsch oder unbelegt ist.\nQuellen: Keine ausreichenden gezielten Quellen in diesem Lauf.\nEinordnung: Die Aussage benötigt eine eigene aktuelle Quellenprüfung, bevor sie öffentlich als korrekt, falsch oder unbelegt bewertet wird.\nNachsuche: Es wurde gezielt nach dem Aussagewortlaut gesucht; es wurden keine ausreichend passenden Treffer gefunden."
+                text = "Bewertung: ⚪ In diesem automatischen Lauf nicht ausreichend geprüft\nWarum: Für diese konkrete Aussage wurden in diesem automatischen Suchlauf keine ausreichend passenden gezielten Quellen gefunden. Das bedeutet nicht, dass es keine Quellen gibt; aus fehlenden Treffern darf nicht abgeleitet werden, dass die Aussage falsch oder unbelegt ist.\nQuellen: In diesem Lauf keine ausreichend passenden gezielten Quellen; weitere Suchvarianten/Primärquellenprüfung nötig.\nEinordnung: Die Aussage benötigt eine eigene aktuelle Quellenprüfung, bevor sie öffentlich als korrekt, falsch oder unbelegt bewertet wird.\nNachsuche: Es wurde gezielt nach dem Aussagewortlaut gesucht; es wurden in diesem Lauf keine ausreichend passenden Treffer gefunden."
                 out = {"url": item.get("url", ""), "title": item.get("title", ""), "claims": group, "targeted_query": targeted_query, "targeted_sources": targeted_sources, "evaluation": text.strip()}
                 evaluations.append(out)
                 (eval_dir / ("group-%02d.txt" % group_index)).write_text(text.strip() + "\n", encoding="utf-8")
@@ -1137,6 +1550,8 @@ Gezielte Quellen nur fuer genau diese Aussage: %s
 
 Wichtige Regeln:
 - Bewerte diese Aussage nur anhand der gezielten Quellen oben und des konkreten Aussagewortlauts.
+- Erfinde keine Quellen, URLs, Titel, Zitate, Zeitpunkte oder Belege. Wenn eine Quelle nicht in den bereitgestellten Treffern steht, darfst du sie nicht als vorhanden ausgeben.
+- Suche aber sorgfältig nach möglichen Quellen fuer alle Behauptungen: pruefe Primärquelle/Originalzitat/Originaldaten, offizielle Stellen, Gegen-/Kontextquellen und abweichende Suchformulierungen. Schreibe nicht vorschnell "keine Quellen vorhanden"; höchstens "in diesem automatischen Lauf nicht ausreichend gefunden".
 - Verwechsle niemals "in diesen Quellen nicht gefunden" mit "falsch" oder "unbelegt".
 - Wenn die gezielten Quellen thematisch nicht passen oder nicht aktuell genug sind, schreibe: "In diesem automatischen Lauf nicht ausreichend geprüft".
 - Pruefe bevorzugt Primaerquellen/Originaldaten/Originalzitate; nutze Sekundaerquellen als Kontext, aber kennzeichne sie.
@@ -1554,6 +1969,8 @@ Regeln:
 - Die Link-Behauptungen wurden zuvor abschnittsweise aus der verlinkten Seite extrahiert; nutze sie als Primaerinhalt.
 - Die Linklekture ist automatisch: Bei sehr langen, JavaScript-lastigen oder blockierten Seiten koennen Inhalte fehlen. Benenne solche Grenzen knapp, falls erkennbar.
 - Die automatisch gefundenen Quellen sind nicht vorab gesichert; bewerte ihre Brauchbarkeit.
+- Erfinde keine Quellen, URLs, Titel, Zitate, Zeitpunkte oder Belege. Wenn eine Quelle nicht in den bereitgestellten Treffern oder im Pruefmaterial steht, darfst du sie nicht als vorhanden ausgeben.
+- Suche aber sorgfältig nach möglichen Quellen fuer alle Behauptungen. Nutze dazu Primaerquelle/Originalzitat/Originaldaten, offizielle Stellen, Gegen-/Kontextquellen und naheliegende alternative Suchformulierungen. Schreibe nicht vorschnell "keine Quellen vorhanden"; falls der Lauf nicht reicht, formuliere: "in diesem automatischen Lauf nicht ausreichend gefunden" und benenne die Suchgrenze.
 - Keine Markdown-Tabelle. Maximal 5200 Zeichen Antwort.
 - Pruefe die wichtigsten Tatsachenbehauptungen gruendlich. Fass Dopplungen zusammen, aber lasse zentrale Gegenargumente nicht weg.
 - Nutze die Quellen nicht nur illustrativ: Suche nach Primaerquelle/Originalzitat/Originaldaten, dann nach unabhaengiger Gegen-/Kontextquelle. Markiere Quellen als Primaerquelle, Kontextquelle, Parteiquelle, Medienbericht oder unbrauchbar/zu allgemein.
@@ -1584,7 +2001,7 @@ Mailinhalt/Kontext:
 
 Automatisch gefundene Gegen-/Kontextquellen:
 %s
-""" % (meta.get("subject") or "(ohne Betreff)", "\n\n".join(claim_lines)[:2600], "\n\n".join(direct_short_lines)[:1000] or "Keine direkten Links erkannt oder abrufbar", short_mail_content, "\n\n".join(short_source_lines) or "Keine Quellen gefunden")
+""" % (meta.get("subject") or "(ohne Betreff)", "\n\n".join(claim_lines)[:2600], "\n\n".join(direct_short_lines)[:1000] or "Keine direkten Links erkannt oder abrufbar", short_mail_content, "\n\n".join(short_source_lines) or "In diesem automatischen Lauf wurden keine Quellen-Treffer an das Modell uebergeben; das bedeutet nicht, dass keine Quellen existieren.")
     compact_source_lines = []
     for i, s in enumerate(sources[:8], 1):
         compact_source_lines.append("[%d] %s\nURL: %s\nAuszug: %s" % (i, s.get("title"), s.get("url"), (s.get("content") or "")[:220]))
@@ -1624,6 +2041,8 @@ Einordnung: <Kontext, Zuspitzung, Framing, Wirkung und was mit dem Leser versuch
 Regeln:
 - Quellen wurden automatisch per Websuche gefunden, nicht vom Nutzer vorgegeben und nicht vorab als gesichert festgelegt.
 - Verwende nicht die Formulierungen "gesicherte Quellen", "zugelassene Quellen" oder "vom Nutzer vorgegebene Quellen".
+- Erfinde keine Quellen, URLs, Titel, Zitate, Zeitpunkte oder Belege. Wenn eine Quelle nicht in den bereitgestellten Treffern oder im Pruefmaterial steht, darfst du sie nicht als vorhanden ausgeben.
+- Suche aber sorgfältig nach möglichen Quellen fuer alle Behauptungen. Nutze dazu Primaerquelle/Originalzitat/Originaldaten, offizielle Stellen, Gegen-/Kontextquellen und naheliegende alternative Suchformulierungen. Schreibe nicht vorschnell "keine Quellen vorhanden"; falls der Lauf nicht reicht, formuliere: "in diesem automatischen Lauf nicht ausreichend gefunden" und benenne die Suchgrenze.
 - Nutze die Quellen gegeneinander: Was stuetzt, was widerspricht, was ist nur Kontext, was passt nicht zur konkreten Behauptung?
 - Bei Bildern/OCR: pruefe den Tatsachenkern auch dann, wenn einzelne Zeichen falsch erkannt wurden.
 - Bei Videos/Transkripten: Nutze Zeit-/Videokontext, falls vorhanden. Veröffentliche oder reproduziere keine fremden Videos, Frames oder Vorschaubilder; arbeite mit Beschreibung, Transkript-Auszügen und Quellen.
@@ -1639,7 +2058,7 @@ Zu pruefender Inhalt:
 
 Automatisch gefundene Quellen:
 %s
-""" % (meta.get("subject") or "(ohne Betreff)", compact_prompt_content, "\n\n".join(compact_source_lines) or "Keine Quellen gefunden")
+""" % (meta.get("subject") or "(ohne Betreff)", compact_prompt_content, "\n\n".join(compact_source_lines) or "In diesem automatischen Lauf wurden keine Quellen-Treffer an das Modell uebergeben; das bedeutet nicht, dass keine Quellen existieren.")
 
 
 def strip_publish_subject(subject: str) -> str:
@@ -1649,11 +2068,13 @@ def strip_publish_subject(subject: str) -> str:
     return subject
 
 
-FACTCHECK_TITLE_MAX_CHARS = 100
+FACTCHECK_TITLE_MAX_CHARS = 0
 
 
 def limit_factcheck_title(title: str, limit: int = FACTCHECK_TITLE_MAX_CHARS) -> str:
     title = re.sub(r"\s+", " ", title or "").strip()
+    if limit <= 0:
+        return title
     if len(title) <= limit:
         return title
     slice_ = title[: max(1, limit - 1)].rstrip()
@@ -2693,7 +3114,7 @@ def process_job(job_dir: Path, settings: dict) -> None:
                 send_mail(settings, meta["reply_to"], "[Faketest abgelehnt] %s" % meta["job_id"], body, meta["job_id"], meta.get("message_id"))
             write_status(job_dir, "fehler", "; ".join(str(item) for item in hard_errors))
             return
-        if status in {"erledigt", "wartet_auf_freigabe", "freigabe_abgelaufen", "limit_erreicht", "fehler"}:
+        if status in {"erledigt", "wartet_auf_freigabe", "wartet_auf_video_antwort", "freigabe_abgelaufen", "limit_erreicht", "fehler"}:
             return
         if status == "freigegeben":
             pass
@@ -2730,7 +3151,15 @@ def process_job(job_dir: Path, settings: dict) -> None:
             write_status(job_dir, "fehler", "kein Text")
             return
         urls = extract_urls((meta.get("subject") or "") + "\n" + body_text + "\n" + body_html + "\n" + combined)
-        direct_links = fetch_direct_links(job_dir, urls, settings) if urls else []
+        direct_links = fetch_direct_links(job_dir, urls, settings, meta) if urls else []
+        video_failures = [item for item in direct_links if item.get("kind") in {"video", "video-page"} and not item.get("ok")]
+        if video_failures:
+            failure_lines = []
+            for item in video_failures:
+                failure_lines.append("- %s: %s" % (item.get("url"), item.get("error") or "Videoinhalt nicht abrufbar"))
+            send_mail(settings, meta["reply_to"], "[Faketest Video blockiert] %s" % meta["job_id"], "Der Video-Faktencheck wurde nicht als normaler Text-Faktencheck weitergeführt, weil der Videoinhalt nicht zuverlässig abgerufen/transkribiert werden konnte.\n\n" + "\n".join(failure_lines), meta["job_id"], meta.get("message_id"))
+            write_status(job_dir, "fehler", "Videoabruf fehlgeschlagen; kein Text-Fallback")
+            return
         direct_claims = extract_link_claims(job_dir, settings, direct_links) if direct_links else []
         direct_text = "\n\n".join("## Direkt verlinkte Seite %s\nTitel: %s\n%s" % (item.get("url"), item.get("title"), item.get("text")) for item in direct_links if item.get("ok") and item.get("text"))
         query_basis = (direct_text + "\n\n" + combined).strip() if direct_text else combined
@@ -2758,6 +3187,12 @@ def process_job(job_dir: Path, settings: dict) -> None:
         subject = "[Faketest Ergebnis][FT-PUB %s %s] %s" % (meta["job_id"], token, clean_subject)
         send_mail(settings, meta["reply_to"], subject, final_with_publish_hint, meta["job_id"], meta.get("message_id"))
         write_status(job_dir, "erledigt")
+    except VideoAwaitingReply as exc:
+        try:
+            write_status(job_dir, "wartet_auf_video_antwort", str(exc)[:1000])
+        except Exception:
+            pass
+        return
     except Exception as exc:
         error_note = "%s: %s" % (exc.__class__.__name__, str(exc) or "(ohne Details)")
         try:

@@ -105,6 +105,17 @@ def detect_publish_request(subject: str) -> tuple[str, str] | None:
     return match.group(1), match.group(2).upper()
 
 
+def detect_video_continue_request(subject: str) -> tuple[str, str, str] | None:
+    match = re.search(
+        r"\[\s*FT-VID\s+([0-9]{8}T[0-9]{6}Z-[a-f0-9]{8})\s+(NEXT|SYNTHESIS)\s+([A-Z0-9][A-Z0-9-]{8,80})\s*\]",
+        subject or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1), match.group(2).upper(), match.group(3).upper()
+
+
 def find_job_dir(base_dir: Path, job_id: str) -> Path | None:
     for root in [base_dir / "Eingang", base_dir / "Fehler", base_dir / "Erledigt"]:
         if not root.exists():
@@ -168,6 +179,42 @@ def write_publish_request(base_dir: Path, job_id: str, token: str, sender: str, 
         else:
             meta["publish_status"] = "live_requested"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return True
+
+
+def write_video_continue_request(base_dir: Path, job_id: str, action: str, token: str, sender: str, subject: str, message_bytes: bytes, settings: dict) -> bool:
+    job_dir = find_job_dir(base_dir, job_id)
+    if not job_dir:
+        return False
+    publish_cfg = settings.get("publish", {})
+    allowed_sender = str(publish_cfg.get("allowed_sender", "chrisheidingsfelder@gmail.com")).strip().lower()
+    request = {
+        "requested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "requested_by": sender,
+        "allowed_sender": allowed_sender,
+        "job_id": job_id,
+        "action": action,
+        "token": token,
+        "subject": subject,
+        "status": "pending" if sender == allowed_sender else "rejected_invalid_sender",
+    }
+    video_dir = job_dir / "video"
+    video_dir.mkdir(exist_ok=True)
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    (video_dir / f"continue-{suffix}.json").write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (video_dir / f"continue-{suffix}.eml").write_bytes(message_bytes)
+    (job_dir / "video_continue_request.json").write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        meta_path = job_dir / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta.setdefault("video_continue_requests", []).append(request)
+        if sender == allowed_sender:
+            meta["status"] = "wartet_auf_bearbeitung"
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if sender == allowed_sender:
+            (job_dir / "status.txt").write_text("STATUS: wartet_auf_bearbeitung\n", encoding="utf-8")
     except Exception:
         pass
     return True
@@ -260,6 +307,13 @@ def main() -> int:
         publish_job, publish_token = publish_request
         ok = write_publish_request(base_dir, publish_job, publish_token, sender, subject, message_bytes, settings)
         print(f"factcheck-router publish job={publish_job} sender={sender} ok={ok}", flush=True)
+        return 0
+
+    video_continue = detect_video_continue_request(subject)
+    if video_continue:
+        video_job, video_action, video_token = video_continue
+        ok = write_video_continue_request(base_dir, video_job, video_action, video_token, sender, subject, message_bytes, settings)
+        print(f"factcheck-router video job={video_job} action={video_action} sender={sender} ok={ok}", flush=True)
         return 0
 
     approval_job = detect_approval(body_text or body_html, subject)
